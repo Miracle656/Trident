@@ -94,7 +94,9 @@ services:
       METRICS_PORT: ${METRICS_PORT:-9090}
       LOG_LEVEL: ${LOG_LEVEL:-info}
       RUST_LOG: ${LOG_LEVEL:-info}
-    depends_on:
+    # Replace (not merge with) the base depends_on so the profile-disabled
+    # pgbouncer dependency is dropped in CI.
+    depends_on: !override
       postgres:
         condition: service_healthy
       redis:
@@ -123,7 +125,9 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-info}
     ports:
       - "${PORT:-3000}:${PORT:-3000}"
-    depends_on:
+    # Replace (not merge with) the base depends_on so the profile-disabled
+    # pgbouncer dependency is dropped in CI.
+    depends_on: !override
       postgres:
         condition: service_healthy
       redis:
