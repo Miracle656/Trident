@@ -1,5 +1,8 @@
 -- Trident PostgreSQL Schema
--- Canonical definition. Migrations in ./migrations/ mirror this file incrementally.
+-- Convenience full-schema snapshot for local/dev bootstrap and documentation.
+-- The migration chain in ./migrations/ (0001-0009) is the source of truth and is
+-- what CI and production apply; this file must mirror the end state of that chain.
+-- Keep in sync whenever a migration is added.
 
 CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 
@@ -23,25 +26,16 @@ CREATE TABLE IF NOT EXISTS soroban_events (
     created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- Single-column indexes
-CREATE INDEX IF NOT EXISTS idx_soroban_events_contract_id       ON soroban_events (contract_id);
-CREATE INDEX IF NOT EXISTS idx_soroban_events_ledger_sequence   ON soroban_events (ledger_sequence);
-CREATE INDEX IF NOT EXISTS idx_soroban_events_ledger_timestamp  ON soroban_events (ledger_timestamp);
-CREATE INDEX IF NOT EXISTS idx_soroban_events_network           ON soroban_events (network);
-CREATE INDEX IF NOT EXISTS idx_soroban_events_topic_0           ON soroban_events (topic_0);
-CREATE INDEX IF NOT EXISTS idx_soroban_events_topic_1           ON soroban_events (topic_1);
-
--- Composite indexes
-CREATE INDEX IF NOT EXISTS idx_soroban_events_contract_topic_0  ON soroban_events (contract_id, topic_0);
-CREATE INDEX IF NOT EXISTS idx_soroban_events_contract_network  ON soroban_events (contract_id, network);
-
--- GIN index for arbitrary topic containment queries
-CREATE INDEX IF NOT EXISTS idx_soroban_events_topics_gin        ON soroban_events USING GIN (topics);
-
--- Unique constraint: a given event position within a transaction is immutable
-ALTER TABLE soroban_events
-    ADD CONSTRAINT uq_soroban_events_tx_index
-    UNIQUE (transaction_hash, event_index);
+-- Indexes — canonical set produced by migrations 0004 and 0009.
+-- network isolation (0004)
+CREATE INDEX IF NOT EXISTS idx_soroban_events_network          ON soroban_events (network);
+CREATE INDEX IF NOT EXISTS idx_soroban_events_network_contract ON soroban_events (network, contract_id);
+-- high-cardinality query patterns (0009)
+CREATE INDEX IF NOT EXISTS idx_soroban_events_contract_ledger  ON soroban_events (contract_id, ledger_sequence DESC);
+CREATE INDEX IF NOT EXISTS idx_soroban_events_contract_topic0  ON soroban_events (contract_id, topic_0)
+    WHERE topic_0 IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_soroban_events_id_desc          ON soroban_events (id DESC);
+CREATE INDEX IF NOT EXISTS idx_soroban_events_ledger_timestamp ON soroban_events (ledger_timestamp DESC);
 
 -- ---------------------------------------------------------------------------
 -- system_state
@@ -49,9 +43,18 @@ ALTER TABLE soroban_events
 -- re-scanning from genesis.
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS system_state (
-    key         TEXT PRIMARY KEY,
-    value       TEXT NOT NULL,
-    updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    key                   TEXT PRIMARY KEY,
+    value                 TEXT        NOT NULL,
+    updated_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    -- indexer health columns (migration 0002)
+    last_poll_at          TIMESTAMPTZ,
+    last_ledger_indexed   BIGINT,
+    events_indexed_total  BIGINT      NOT NULL DEFAULT 0,
+    events_in_last_poll   INT         NOT NULL DEFAULT 0,
+    poll_duration_ms      INT         NOT NULL DEFAULT 0,
+    -- alerting state columns (migration 0003)
+    last_alert_at         TIMESTAMPTZ,
+    alert_fired           BOOLEAN     NOT NULL DEFAULT FALSE
 );
 
 -- Seed the cursor row so the indexer can always do an UPDATE rather than
@@ -113,6 +116,43 @@ CREATE TABLE IF NOT EXISTS api_keys (
 CREATE INDEX IF NOT EXISTS idx_api_keys_key_hash ON api_keys (key_hash);
 CREATE INDEX IF NOT EXISTS idx_api_keys_active ON api_keys (key_hash)
     WHERE revoked_at IS NULL;
+
+-- ---------------------------------------------------------------------------
+-- audit_log
+-- Per-request audit trail for API key usage (migration 0006).
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS audit_log (
+    id           BIGSERIAL   PRIMARY KEY,
+    api_key_id   UUID        REFERENCES api_keys(id) ON DELETE SET NULL,
+    endpoint     TEXT        NOT NULL,
+    method       TEXT        NOT NULL,
+    ip           INET,
+    user_agent   TEXT,
+    status_code  INT         NOT NULL,
+    duration_ms  INT         NOT NULL,
+    result_count INT,
+    request_id   TEXT        NOT NULL,
+    network      TEXT,
+    ts           TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_audit_log_key_ts ON audit_log (api_key_id, ts DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_log_ts     ON audit_log (ts DESC);
+
+-- ---------------------------------------------------------------------------
+-- parse_errors
+-- Audit trail for events that failed XDR decoding (migration 0008).
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS parse_errors (
+    id               UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    ledger_sequence  BIGINT      NOT NULL,
+    event_index      INT         NOT NULL,
+    raw_payload      TEXT        NOT NULL,
+    error_message    TEXT        NOT NULL,
+    occurred_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_parse_errors_occurred_at ON parse_errors (occurred_at DESC);
 
 -- ---------------------------------------------------------------------------
 -- webhook_subscriptions
