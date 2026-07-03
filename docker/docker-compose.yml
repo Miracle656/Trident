@@ -100,8 +100,10 @@ services:
 
   api:
     build:
-      context: ../services/api
-      dockerfile: Dockerfile
+      # Root context: services/api/Dockerfile uses repo-root-relative COPY
+      # paths (COPY services/api/...), matching the standalone CI image build.
+      context: ..
+      dockerfile: services/api/Dockerfile
     environment:
       # Route through PgBouncer, never postgres:5432 directly.
       DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@pgbouncer:6432/${POSTGRES_DB}
