@@ -5,6 +5,12 @@ FROM rust:1-slim AS builder
 
 WORKDIR /app
 
+# Native build dependencies for -sys crates (openssl-sys needs pkg-config +
+# libssl-dev + a C toolchain).
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends build-essential pkg-config libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
 # Cache dependency fetch separately from source compilation.
 COPY Cargo.toml Cargo.lock ./
 COPY proto/ proto/
@@ -30,7 +36,7 @@ RUN cargo build --release -p trident-api
 FROM debian:bookworm-slim AS runtime
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
+    && apt-get install -y --no-install-recommends ca-certificates libssl3 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /app/target/release/trident-api /usr/local/bin/trident-api
