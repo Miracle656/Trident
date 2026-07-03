@@ -30,7 +30,10 @@ RUN mkdir -p crates/common/src crates/api/src crates/indexer/src crates/backfill
 
 COPY . .
 
-RUN cargo build --release -p trident-api
+# Refresh mtimes so cargo rebuilds the real crates instead of reusing the
+# cached stub artifacts from the dependency-caching layer above.
+RUN find crates sdk -name '*.rs' -exec touch {} + \
+    && cargo build --release -p trident-api
 
 # ── runtime ──────────────────────────────────────────────────────────────────
 FROM debian:bookworm-slim AS runtime
