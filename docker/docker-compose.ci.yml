@@ -34,7 +34,7 @@ services:
     volumes:
       - ../database/schema.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
       - ../database/migrations/0002_system_state_health.sql:/docker-entrypoint-initdb.d/02_health.sql:ro
-      - ../database/migrations/0003_api_keys.sql:/docker-entrypoint-initdb.d/03_api_keys.sql:ro
+      - ../database/migrations/0005_api_keys.sql:/docker-entrypoint-initdb.d/03_api_keys.sql:ro
       - ../database/migrations/0003_alert_webhook.sql:/docker-entrypoint-initdb.d/04_alert_webhook.sql:ro
       - ../database/migrations/0004_soroban_events_network.sql:/docker-entrypoint-initdb.d/05_events_network.sql:ro
       - ./ci-seed.sql:/docker-entrypoint-initdb.d/99_ci_seed.sql:ro
