@@ -303,6 +303,11 @@ mod tests {
     async fn insert_event_is_idempotent() {
         let db_url = match std::env::var("TEST_DATABASE_URL") {
             Ok(url) => url,
+            // Hard-fail under the rust-integration CI job (REQUIRE_TEST_SERVICES)
+            // so a misconfigured DB URL cannot silently skip and go green.
+            Err(_) if std::env::var("REQUIRE_TEST_SERVICES").is_ok() => {
+                panic!("TEST_DATABASE_URL must be set when REQUIRE_TEST_SERVICES is set");
+            }
             Err(_) => {
                 eprintln!("SKIP: TEST_DATABASE_URL not set");
                 return;

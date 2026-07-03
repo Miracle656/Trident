@@ -364,23 +364,25 @@ mod tests {
 
     use super::*;
 
+    // When REQUIRE_TEST_SERVICES is set (the rust-integration CI job sets it),
+    // a missing URL is a hard failure instead of a silent skip — otherwise a
+    // misconfigured integration job would go green without running anything.
     macro_rules! require_services {
         () => {{
-            let db = match std::env::var("TEST_DATABASE_URL") {
-                Ok(url) => url,
-                Err(_) => {
-                    eprintln!("SKIP: TEST_DATABASE_URL not set");
+            let required = std::env::var("REQUIRE_TEST_SERVICES").is_ok();
+            match (
+                std::env::var("TEST_DATABASE_URL"),
+                std::env::var("TEST_REDIS_URL"),
+            ) {
+                (Ok(db), Ok(rd)) => (db, rd),
+                _ if required => panic!(
+                    "TEST_DATABASE_URL and TEST_REDIS_URL must be set when REQUIRE_TEST_SERVICES is set"
+                ),
+                _ => {
+                    eprintln!("SKIP: TEST_DATABASE_URL / TEST_REDIS_URL not set");
                     return;
                 }
-            };
-            let rd = match std::env::var("TEST_REDIS_URL") {
-                Ok(url) => url,
-                Err(_) => {
-                    eprintln!("SKIP: TEST_REDIS_URL not set");
-                    return;
-                }
-            };
-            (db, rd)
+            }
         }};
     }
 
