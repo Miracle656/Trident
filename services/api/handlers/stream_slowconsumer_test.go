@@ -137,7 +137,7 @@ func TestStream_SlowConsumerNeverReadingIsDisconnected(t *testing.T) {
 // the same counter the operator-facing /metrics endpoint exposes.
 func testReadSSEDisconnectMetric() int64 {
 	rec := httptest.NewRecorder()
-	handlers.MetricsHandler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	handlers.MetricsHandler(nil, nil).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
 	body := rec.Body.String()
 	return parsePrometheusCounter(body, "trident_sse_slow_consumer_disconnects_total")
 }

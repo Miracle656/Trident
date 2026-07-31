@@ -88,6 +88,10 @@ func GRPCToHTTP(err error) (int, ErrorCode) {
 		// The backend did not answer within the call deadline: a gateway
 		// timeout, not an internal fault — clients may retry (issue #227).
 		return http.StatusGatewayTimeout, UNAVAILABLE
+	case codes.Unavailable:
+		// The backend is unreachable or refusing connections: a transient
+		// upstream outage, not an internal fault — clients may retry.
+		return http.StatusServiceUnavailable, UNAVAILABLE
 	default:
 		return http.StatusInternalServerError, INTERNAL
 	}

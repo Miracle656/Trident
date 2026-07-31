@@ -276,7 +276,7 @@ func main() {
 	mux.HandleFunc("GET /v1/webhooks/{id}/deliveries", deliveriesWebhookHandler(webhookDB))
 	mux.HandleFunc("GET /v1/webhooks/{id}/dead-letters", deadLettersWebhookHandler(webhookDB))
 	mux.HandleFunc("POST /v1/webhooks/{id}/dead-letters/{deliveryId}/replay", replayDeadLetterHandler(webhookDB))
-	mux.HandleFunc("GET /metrics", handlers.MetricsHandler())
+	mux.HandleFunc("GET /metrics", handlers.MetricsHandler(pool, redisClient))
 	mux.HandleFunc("GET /internal/status", handlers.InternalStatus())
 	mux.Handle("/ws", middleware.WSConnectionLimit(ws.Handler(hub)))
 	keyValidator := middleware.Validator(middleware.ParseKeyHashes(os.Getenv("API_KEY_HASHES")))
