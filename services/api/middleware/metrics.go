@@ -93,26 +93,26 @@ func PrometheusHTTP(next http.Handler) http.Handler {
 // WriteHTTPMetrics renders trident_api_http_requests_total and
 // trident_api_http_request_duration_seconds in Prometheus text format.
 func WriteHTTPMetrics(w io.Writer) {
-	fmt.Fprint(w, "# HELP trident_api_http_requests_total Total HTTP requests received.\n")
-	fmt.Fprint(w, "# TYPE trident_api_http_requests_total counter\n")
-	fmt.Fprint(w, "# HELP trident_api_http_request_duration_seconds HTTP request latency in seconds.\n")
-	fmt.Fprint(w, "# TYPE trident_api_http_request_duration_seconds histogram\n")
+	_, _ = fmt.Fprint(w, "# HELP trident_api_http_requests_total Total HTTP requests received.\n")
+	_, _ = fmt.Fprint(w, "# TYPE trident_api_http_requests_total counter\n")
+	_, _ = fmt.Fprint(w, "# HELP trident_api_http_request_duration_seconds HTTP request latency in seconds.\n")
+	_, _ = fmt.Fprint(w, "# TYPE trident_api_http_request_duration_seconds histogram\n")
 
 	httpMetricsMu.Lock()
 	defer httpMetricsMu.Unlock()
 
 	for key, series := range httpMetricsData {
 		for i, bound := range httpLatencyBuckets {
-			fmt.Fprintf(w, "trident_api_http_request_duration_seconds_bucket{method=%q,route=%q,status=%q,le=%q} %d\n",
+			_, _ = fmt.Fprintf(w, "trident_api_http_request_duration_seconds_bucket{method=%q,route=%q,status=%q,le=%q} %d\n",
 				key.method, key.pattern, key.status, formatBucketBound(bound), series.bucketCounts[i])
 		}
-		fmt.Fprintf(w, "trident_api_http_request_duration_seconds_bucket{method=%q,route=%q,status=%q,le=\"+Inf\"} %d\n",
+		_, _ = fmt.Fprintf(w, "trident_api_http_request_duration_seconds_bucket{method=%q,route=%q,status=%q,le=\"+Inf\"} %d\n",
 			key.method, key.pattern, key.status, series.count)
-		fmt.Fprintf(w, "trident_api_http_request_duration_seconds_sum{method=%q,route=%q,status=%q} %g\n",
+		_, _ = fmt.Fprintf(w, "trident_api_http_request_duration_seconds_sum{method=%q,route=%q,status=%q} %g\n",
 			key.method, key.pattern, key.status, series.sum)
-		fmt.Fprintf(w, "trident_api_http_request_duration_seconds_count{method=%q,route=%q,status=%q} %d\n",
+		_, _ = fmt.Fprintf(w, "trident_api_http_request_duration_seconds_count{method=%q,route=%q,status=%q} %d\n",
 			key.method, key.pattern, key.status, series.count)
-		fmt.Fprintf(w, "trident_api_http_requests_total{method=%q,route=%q,status=%q} %d\n",
+		_, _ = fmt.Fprintf(w, "trident_api_http_requests_total{method=%q,route=%q,status=%q} %d\n",
 			key.method, key.pattern, key.status, series.count)
 	}
 }
