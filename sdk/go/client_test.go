@@ -342,7 +342,6 @@ func TestSubscribeToContract_ReceivesAndDecodesEvent(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewClient(TridentClientConfig{BaseURL: server.URL})
 	client := NewClient(TridentClientConfig{
 		BaseURL: server.URL,
 		APIKey:  "test-key",
