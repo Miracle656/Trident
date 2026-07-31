@@ -133,7 +133,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/v1/contracts/{id}/metadata": {
+    "/v1/contracts/{id}/spec": {
         parameters: {
             query?: never;
             header?: never;
@@ -141,10 +141,50 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * Get token metadata for a contract
-         * @description Returns cached name/symbol/decimals for a SEP-41 token contract, resolved via a read-only simulateTransaction call. `is_token` is false, with the other fields null, both when the contract has not been resolved yet and when it was resolved and found not to implement the token interface.
+         * Get a contract's parsed spec and detected interfaces
+         * @description Returns the functions captured from a tracked contract's spec (contractmeta / SEP-48) and the standard interfaces detected from them (e.g. SEP-41 token, NFT).
          */
-        get: operations["getContractTokenMetadata"];
+        get: operations["getContractSpec"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/contracts/{id}/storage": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get a contract's latest storage snapshot values
+         * @description Returns the most recently observed value for every storage key snapshotted for a tracked contract.
+         */
+        get: operations["getContractStorageLatest"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/contracts/{id}/storage/history": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get the change history of a single contract storage key
+         * @description Returns every recorded change for one storage key, oldest first, for a tracked contract.
+         */
+        get: operations["getContractStorageHistory"];
         put?: never;
         post?: never;
         delete?: never;
@@ -162,7 +202,7 @@ export interface paths {
         };
         /**
          * Get indexer statistics
-         * @description Returns real-time indexer health metrics and throughput
+         * @description Returns real-time indexer health metrics, throughput, and the public data-freshness contract (lag_ledgers, lag_seconds_estimated, last_ledger_indexed) — see docs/observability/data-freshness.md
          */
         get: operations["getIndexerStats"];
         put?: never;
@@ -372,6 +412,11 @@ export interface components {
              */
             lag_ledgers?: number | null;
             /**
+             * Format: double
+             * @description Estimated wall-clock staleness in seconds: lag_ledgers times Stellar's protocol-target ledger close time (~5s). Null whenever lag_ledgers is null. See docs/observability/data-freshness.md for the full freshness contract this field is part of.
+             */
+            lag_seconds_estimated?: number | null;
+            /**
              * Format: int64
              * @description Cumulative events indexed
              */
@@ -442,6 +487,58 @@ export interface components {
             /** @description Field type inferred from the contract interface or observed payloads */
             type: string;
         };
+        ContractSpecResponse: {
+            /** @description Soroban contract address */
+            contract_id: string;
+            /**
+             * @description Network queried
+             * @enum {string}
+             */
+            network: "testnet" | "mainnet";
+            /** @description Deployed WASM code hash this spec was parsed from */
+            code_hash: string;
+            /** @description Whether an embedded contractspecv0 section was found */
+            has_spec: boolean;
+            /** @description Primary classification derived from detected interfaces (e.g. token, nft, custom) */
+            contract_type: string;
+            /** @description Every standard interface detected from the contract's spec functions */
+            interfaces: string[];
+            /** @description Functions captured from the contract's spec */
+            functions: components["schemas"]["ContractSpecFunction"][];
+        };
+        ContractSpecFunction: {
+            /** @description Exported function name */
+            name: string;
+        };
+        ContractStorageResponse: {
+            /** @description Soroban contract address */
+            contract_id: string;
+            /**
+             * @description Network queried
+             * @enum {string}
+             */
+            network: "testnet" | "mainnet";
+            /** @description Storage snapshot values (latest, or full history when queried via /storage/history) */
+            values: components["schemas"]["ContractStorageValue"][];
+        };
+        ContractStorageValue: {
+            /** @description Base64-encoded XDR LedgerKey this value was read from */
+            storage_key: string;
+            /** @description Human-readable decoded storage key */
+            key: unknown;
+            /** @description Human-readable decoded value (absent when the entry was removed) */
+            value?: unknown;
+            /**
+             * Format: int64
+             * @description Ledger sequence at which this value was observed
+             */
+            ledger_sequence: number;
+            /**
+             * Format: date-time
+             * @description Timestamp this snapshot row was recorded
+             */
+            observed_at: string;
+        };
         ContractStatsResponse: {
             /** @description Contracts sorted by event count (descending) */
             contracts: components["schemas"]["ContractStats"][];
@@ -508,6 +605,15 @@ export interface components {
         };
         /** @description Missing or invalid API key */
         Unauthorized: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["ErrorResponse"];
+            };
+        };
+        /** @description Requested resource was not found */
+        NotFound: {
             headers: {
                 [name: string]: unknown;
             };
@@ -728,7 +834,7 @@ export interface operations {
             503: components["responses"]["ServiceUnavailable"];
         };
     };
-    getContractTokenMetadata: {
+    getContractSpec: {
         parameters: {
             query?: never;
             header?: never;
@@ -740,13 +846,69 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Cached token metadata (or a not-a-token / not-yet-resolved result) */
+            /** @description Contract spec and detected interfaces */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["TokenMetadataResponse"];
+                    "application/json": components["schemas"]["ContractSpecResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    getContractStorageLatest: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Soroban contract address */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Latest known value per storage key */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ContractStorageResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    getContractStorageHistory: {
+        parameters: {
+            query: {
+                /** @description Storage key to fetch history for, as returned by the storage/spec endpoints */
+                key: string;
+            };
+            header?: never;
+            path: {
+                /** @description Soroban contract address */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Recorded changes for the requested storage key */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ContractStorageResponse"];
                 };
             };
             400: components["responses"]["BadRequest"];

@@ -122,6 +122,10 @@ description is accurate. Keep this file honest by hand.
 | `RATE_LIMIT_FREE_RPS` | Optional | `10` | Requests/sec limit, free tier. |
 | `RATE_LIMIT_PRO_RPS` | Optional | `100` | Requests/sec limit, pro/standard tier. |
 | `RATE_LIMIT_INTERNAL_RPS` | Optional | `1000` | Requests/sec limit, internal tier. |
+| `PER_IP_RATE_LIMIT_RPS` | Optional | `20` | Pre-auth per-IP request limit, applied before any API key is checked (issue #318). |
+| `PER_IP_RATE_LIMIT_WINDOW_MS` | Optional | `1000` | Window for `PER_IP_RATE_LIMIT_RPS`. |
+| `MAX_IN_FLIGHT_REQUESTS` | Optional | `500` | Global concurrency cap; requests beyond it are shed rather than queued. |
+| `TRUSTED_PROXY_ENABLED` | Optional | `false` | **Security-sensitive.** When `true`, the per-IP limiter attributes requests to the last hop in `X-Forwarded-For` instead of the TCP peer. Only enable when the API sits behind a proxy that *appends* to XFF (as `docker/nginx/nginx.conf` does) and is not directly reachable. Enabling it on a directly-reachable API lets any client forge its own source IP and bypass per-IP limiting. |
 | `RETENTION_AUDIT_LOG_DAYS` | Optional | `90` | Days to retain audit log rows. |
 | `RETENTION_PARSE_ERRORS_DAYS` | Optional | `30` | Days to retain parse-error rows. |
 | `RETENTION_WEBHOOK_DELIVERIES_DAYS` | Optional | `30` | Days to retain webhook delivery records. |
