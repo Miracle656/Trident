@@ -154,19 +154,27 @@ fn db_err(e: sqlx::Error) -> Status {
 
 fn validate_list_events(req: &ListEventsRequest) -> Result<(), Status> {
     if req.contract_id.len() > 256 {
-        return Err(Status::invalid_argument("contract_id must be at most 256 characters"));
+        return Err(Status::invalid_argument(
+            "contract_id must be at most 256 characters",
+        ));
     }
 
     if req.topic_0.len() > 128 {
-        return Err(Status::invalid_argument("topic_0 must be at most 128 characters"));
+        return Err(Status::invalid_argument(
+            "topic_0 must be at most 128 characters",
+        ));
     }
 
     if req.topic_1.len() > 128 {
-        return Err(Status::invalid_argument("topic_1 must be at most 128 characters"));
+        return Err(Status::invalid_argument(
+            "topic_1 must be at most 128 characters",
+        ));
     }
 
     if req.network.len() > 64 {
-        return Err(Status::invalid_argument("network must be at most 64 characters"));
+        return Err(Status::invalid_argument(
+            "network must be at most 64 characters",
+        ));
     }
 
     Ok(())
@@ -178,7 +186,9 @@ fn validate_get_event(req: &GetEventRequest) -> Result<(), Status> {
     }
 
     if req.network.len() > 64 {
-        return Err(Status::invalid_argument("network must be at most 64 characters"));
+        return Err(Status::invalid_argument(
+            "network must be at most 64 characters",
+        ));
     }
 
     Ok(())

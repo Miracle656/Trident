@@ -113,7 +113,12 @@ pub trait AlertSink: Send + Sync {
     async fn post_recovery(&self, client: &Client, url: &str, payload: &RecoveryPayload) -> bool;
 
     /// Post an RPC degraded payload.
-    async fn post_rpc_degraded(&self, client: &Client, url: &str, payload: &RpcDegradedPayload) -> bool;
+    async fn post_rpc_degraded(
+        &self,
+        client: &Client,
+        url: &str,
+        payload: &RpcDegradedPayload,
+    ) -> bool;
 }
 
 /// Generic JSON webhook sink — posts the serialised payload as-is.
@@ -129,7 +134,12 @@ impl AlertSink for GenericWebhook {
         post_json_with_retry(client, url, payload).await
     }
 
-    async fn post_rpc_degraded(&self, client: &Client, url: &str, payload: &RpcDegradedPayload) -> bool {
+    async fn post_rpc_degraded(
+        &self,
+        client: &Client,
+        url: &str,
+        payload: &RpcDegradedPayload,
+    ) -> bool {
         post_json_with_retry(client, url, payload).await
     }
 }
@@ -195,7 +205,12 @@ impl AlertSink for SlackWebhook {
         post_json_with_retry(client, url, &slack).await
     }
 
-    async fn post_rpc_degraded(&self, client: &Client, url: &str, payload: &RpcDegradedPayload) -> bool {
+    async fn post_rpc_degraded(
+        &self,
+        client: &Client,
+        url: &str,
+        payload: &RpcDegradedPayload,
+    ) -> bool {
         #[derive(Serialize)]
         struct SlackBlock {
             #[serde(rename = "type")]
@@ -317,7 +332,12 @@ impl AlertSink for PagerDuty {
         post_json_with_retry(client, url, &pd).await
     }
 
-    async fn post_rpc_degraded(&self, client: &Client, url: &str, payload: &RpcDegradedPayload) -> bool {
+    async fn post_rpc_degraded(
+        &self,
+        client: &Client,
+        url: &str,
+        payload: &RpcDegradedPayload,
+    ) -> bool {
         #[derive(Serialize)]
         struct PDEvent {
             r#type: &'static str,

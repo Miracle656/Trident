@@ -283,10 +283,10 @@ pub(crate) fn scaddress_to_string(addr: &ScAddress) -> String {
 mod tests {
     use super::*;
     use base64::{engine::general_purpose::STANDARD, Engine};
-        use stellar_xdr::curr::{
-            AccountId, ContractId, Hash, Int128Parts, Int256Parts, Limited, Limits, PublicKey,
-            ScAddress, ScMap, ScMapEntry, ScSymbol, ScVal, Uint256, VecM, WriteXdr,
-        };
+    use stellar_xdr::curr::{
+        AccountId, ContractId, Hash, Int128Parts, Int256Parts, Limited, Limits, PublicKey,
+        ScAddress, ScMap, ScMapEntry, ScSymbol, ScVal, Uint256, VecM, WriteXdr,
+    };
 
     use crate::rpc::RawEvent;
 
@@ -524,7 +524,11 @@ mod tests {
         let raw = make_event("contract", None, vec![], v, true);
         let event = Parser::new(false).parse_event(&raw).unwrap().unwrap();
 
-        assert_eq!(event.data, serde_json::json!("1"), "u256(1) must encode as \"1\"");
+        assert_eq!(
+            event.data,
+            serde_json::json!("1"),
+            "u256(1) must encode as \"1\""
+        );
     }
 
     #[test]
@@ -539,7 +543,11 @@ mod tests {
         let raw = make_event("contract", None, vec![], v, true);
         let event = Parser::new(false).parse_event(&raw).unwrap().unwrap();
 
-        assert_eq!(event.data, serde_json::json!("-1"), "i256(-1) must encode as \"-1\"");
+        assert_eq!(
+            event.data,
+            serde_json::json!("-1"),
+            "i256(-1) must encode as \"-1\""
+        );
     }
 
     #[test]

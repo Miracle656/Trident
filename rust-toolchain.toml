@@ -1,0 +1,12 @@
+[toolchain]
+# Pinned so CI and local builds agree on one rustc. dtolnay/rust-toolchain
+# resolves its version from this file when the workflow step passes no
+# `toolchain:` input, which every Rust job in .github/workflows/ci.yml relies
+# on. Without it the action cannot resolve a toolchain and every Rust job
+# fails at "Install Rust toolchain" before compiling anything.
+#
+# 1.85 is the floor: the Soroban contracts in contracts/ build for
+# wasm32v1-none, which older toolchains do not know about.
+channel = "1.90.0"
+components = ["rustfmt", "clippy"]
+targets = ["wasm32v1-none"]

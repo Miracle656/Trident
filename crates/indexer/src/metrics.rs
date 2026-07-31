@@ -130,6 +130,7 @@ pub fn install(port: u16) -> Result<(), TridentError> {
     describe_counter!(
         RPC_ERRORS_TOTAL,
         "RPC call failures labelled by method and error_type (issue #294)"
+    );
     describe_counter!(
         EVENTS_BY_CONTRACT_TOTAL,
         "Events processed per contract (bounded: allowlisted contract IDs + 'other' bucket)"
@@ -257,6 +258,8 @@ pub fn record_rpc_call_duration(method: &'static str, endpoint_index: usize, sec
 /// failure mode is driving it (issue #294).
 pub fn record_rpc_error(method: &'static str, error_type: &'static str) {
     counter!(RPC_ERRORS_TOTAL, "method" => method, "error_type" => error_type).increment(1);
+}
+
 /// Increment the per-contract event counter. `contract_id` must be either an
 /// allowlisted contract ID or the sentinel `"other"` — never an unbounded value.
 pub fn record_events_by_contract(contract_id: &str, count: u64) {

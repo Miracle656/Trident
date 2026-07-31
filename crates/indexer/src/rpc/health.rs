@@ -191,16 +191,17 @@ impl RpcHealthScorer {
     /// Returns true if the endpoint is stale and deducts 10 points.
     pub fn check_and_record_stale(&self, url: &str) -> bool {
         let endpoints = self.endpoints.read().expect("endpoints lock poisoned");
-        
+
         let health = match endpoints.get(url) {
             Some(h) => h,
             None => return false,
         };
 
-        let (current_ledger, current_timestamp) = match (health.last_ledger, health.last_ledger_timestamp) {
-            (Some(l), Some(t)) => (l, t),
-            _ => return false,
-        };
+        let (current_ledger, current_timestamp) =
+            match (health.last_ledger, health.last_ledger_timestamp) {
+                (Some(l), Some(t)) => (l, t),
+                _ => return false,
+            };
 
         let now = Instant::now();
 
@@ -210,14 +211,18 @@ impl RpcHealthScorer {
                 continue;
             }
 
-            if let (Some(other_ledger), Some(other_timestamp)) = (other_health.last_ledger, other_health.last_ledger_timestamp) {
+            if let (Some(other_ledger), Some(other_timestamp)) =
+                (other_health.last_ledger, other_health.last_ledger_timestamp)
+            {
                 // If the other endpoint has a more recent ledger and this one hasn't advanced
                 if other_ledger > current_ledger {
                     let time_since_other = now.saturating_duration_since(other_timestamp);
                     let time_since_current = now.saturating_duration_since(current_timestamp);
 
                     // If the other endpoint's data is recent enough and this one is behind
-                    if time_since_other < STALE_LEDGER_THRESHOLD && time_since_current > STALE_LEDGER_THRESHOLD {
+                    if time_since_other < STALE_LEDGER_THRESHOLD
+                        && time_since_current > STALE_LEDGER_THRESHOLD
+                    {
                         self.apply_deduction(url, DEDUCT_STALE_LEDGER);
                         return true;
                     }
@@ -439,7 +444,7 @@ mod tests {
         let s = scorer();
         s.record_success("https://primary.example", Some(100));
         s.record_success("https://backup.example", Some(95));
-        
+
         // Verify scores are updated
         assert_eq!(s.get_score("https://primary.example"), 100);
         assert_eq!(s.get_score("https://backup.example"), 100);
@@ -451,7 +456,7 @@ mod tests {
         // Both endpoints report the same ledger - no stale detection
         s.record_success("https://primary.example", Some(100));
         s.record_success("https://backup.example", Some(100));
-        
+
         assert!(!s.check_and_record_stale("https://primary.example"));
         assert_eq!(s.get_score("https://primary.example"), 100);
     }
@@ -462,7 +467,7 @@ mod tests {
         s.record_timeout("https://primary.example"); // -20 -> 80
         s.record_non_200("https://primary.example"); // -15 -> 65
         s.record_rpc_error("https://primary.example"); // -10 -> 55
-        
+
         assert_eq!(s.get_score("https://primary.example"), 55);
     }
 
@@ -470,11 +475,11 @@ mod tests {
     fn recovery_eventually_restores_to_100() {
         let s = scorer();
         s.record_connection_refused("https://primary.example"); // 70
-        
+
         for _ in 0..10 {
             s.record_success("https://primary.example", Some(100));
         }
-        
+
         assert_eq!(s.get_score("https://primary.example"), 100);
     }
 
@@ -486,12 +491,12 @@ mod tests {
             "https://backup2.example".to_string(),
         ])
         .unwrap();
-        
+
         // Primary degraded, backup1 degraded, backup2 healthy
         s.record_connection_refused("https://primary.example"); // 70
         s.record_connection_refused("https://backup1.example"); // 70
         s.record_connection_refused("https://backup1.example"); // 40
-        
+
         assert_eq!(s.select_best_endpoint(), "https://backup2.example");
     }
 

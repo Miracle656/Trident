@@ -168,12 +168,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Let the relay drain its current pass before the process exits, bounded
     // by the shutdown grace period (issue #205).
-    match tokio::time::timeout(
-        Duration::from_secs(SHUTDOWN_GRACE_SECS),
-        relay_handle,
-    )
-    .await
-    {
+    match tokio::time::timeout(Duration::from_secs(SHUTDOWN_GRACE_SECS), relay_handle).await {
         Ok(Ok(_)) => {}
         Ok(Err(e)) => {
             tracing::warn!(error = %e, "Outbox relay task did not shut down cleanly");
