@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { parseApiError, TridentApiError, TridentError } from "./errors.js";
+import { redactKey, resolveApiKey, resolveApiUrl } from "./config.js";
 import { createSubscription } from "./subscription.js";
 import { iterEvents as iterEventsImpl } from "./iterator.js";
 import type { IterEventsOptions } from "./iterator.js";
@@ -14,6 +15,7 @@ import type { RetryConfig } from "./retry.js";
 
 export { TridentError, TridentApiError } from "./errors.js";
 export type { TridentErrorCode } from "./errors.js";
+export { ENV_API_KEY, ENV_BASE_URL, redactKey } from "./config.js";
 export { iterEvents, DEFAULT_MAX_PAGES } from "./iterator.js";
 export type { IterEventsOptions, QueryEventsFn } from "./iterator.js";
 export { DEFAULT_RETRY_CONFIG } from "./retry.js";

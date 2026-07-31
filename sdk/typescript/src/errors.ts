@@ -1,6 +1,7 @@
 import { z } from "zod";
 
 export type TridentErrorCode =
+  | "CONFIG"
   | "NOT_FOUND"
   | "UNAUTHORIZED"
   | "RATE_LIMITED"
