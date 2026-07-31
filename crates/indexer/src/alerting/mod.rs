@@ -18,6 +18,7 @@
 //! - **Severity levels**: `info`, `warning`, `critical` route to different
 //!   sinks or the same sink with formatted payloads.
 
+#![allow(dead_code)] // Slack/PagerDuty sinks and Severity::Info are configured but not yet wired into the Alerter constructor.
 use chrono::Utc;
 use reqwest::Client;
 use serde::Serialize;
@@ -67,7 +68,7 @@ pub struct AlertState {
 }
 
 #[derive(Debug, Serialize)]
-struct WebhookPayload {
+pub(crate) struct WebhookPayload {
     alert: &'static str,
     severity: String,
     indexer: &'static str,
@@ -83,7 +84,7 @@ struct WebhookPayload {
 }
 
 #[derive(Debug, Serialize)]
-struct RecoveryPayload {
+pub(crate) struct RecoveryPayload {
     alert: &'static str,
     lag_ledgers: u64,
     timestamp: String,
@@ -92,7 +93,7 @@ struct RecoveryPayload {
 }
 
 #[derive(Debug, Serialize)]
-struct RpcDegradedPayload {
+pub(crate) struct RpcDegradedPayload {
     alert: &'static str,
     severity: String,
     indexer: &'static str,

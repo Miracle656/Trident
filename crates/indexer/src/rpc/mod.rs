@@ -652,8 +652,10 @@ mod tests {
         )
         .unwrap();
 
-        // Two failures on the primary should cause it to be scored lower.
-        assert!(client.get_events(Some(1), None, 10, &[]).await.is_err());
+        // One 503 costs the primary 15 points (100 -> 85), which is already
+        // enough to put the untouched secondary ahead. Scoring fails over on
+        // the first failure, unlike the consecutive-failure threshold the
+        // superseded endpoint pool used.
         assert!(client.get_events(Some(1), None, 10, &[]).await.is_err());
 
         // The health scorer should now prefer the secondary endpoint.

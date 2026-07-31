@@ -81,7 +81,10 @@ impl EndpointHealth {
     }
 
     fn apply_deduction(&mut self, amount: u8) {
-        self.score = self.score.saturating_sub(amount).max(MIN_SCORE);
+        // MIN_SCORE is 0 and `score` is a u8, so saturating_sub already floors
+        // here — unlike apply_recovery, where MAX_SCORE is below u8::MAX and
+        // the clamp does real work.
+        self.score = self.score.saturating_sub(amount);
     }
 
     fn apply_recovery(&mut self) {
@@ -94,6 +97,7 @@ impl EndpointHealth {
         self.last_ledger_timestamp = Some(Instant::now());
     }
 
+    #[allow(dead_code)]
     fn set_score(&mut self, score: u8) {
         self.score = score;
     }
@@ -107,6 +111,10 @@ impl EndpointHealth {
 pub struct RpcHealthScorer {
     endpoints: RwLock<HashMap<String, EndpointHealth>>,
     scores: RwLock<HashMap<String, u8>>,
+    /// Configured endpoints in priority order; index 0 is the primary. The
+    /// maps above are keyed by URL and so have no stable ordering, which would
+    /// otherwise make an all-equal selection depend on hash order.
+    priority: Vec<String>,
 }
 
 impl RpcHealthScorer {
@@ -123,14 +131,15 @@ impl RpcHealthScorer {
         let mut endpoints = HashMap::new();
         let mut scores = HashMap::new();
 
-        for url in urls {
+        for url in &urls {
             endpoints.insert(url.clone(), EndpointHealth::new());
-            scores.insert(url, INITIAL_SCORE);
+            scores.insert(url.clone(), INITIAL_SCORE);
         }
 
         Ok(Self {
             endpoints: RwLock::new(endpoints),
             scores: RwLock::new(scores),
+            priority: urls,
         })
     }
 
@@ -241,47 +250,38 @@ impl RpcHealthScorer {
         let scores = self.scores.read().expect("scores lock poisoned");
         let endpoints = self.endpoints.read().expect("endpoints lock poisoned");
 
-        let mut best_url = None;
+        let mut best_url: Option<&String> = None;
         let mut best_score = MIN_SCORE;
-        let mut best_last_success = None;
+        let mut best_last_success: Option<Instant> = None;
 
-        for (url, health) in endpoints.iter() {
+        // Walk in configured priority order so that when everything else ties
+        // the earlier-listed endpoint keeps serving. Iterating the HashMap
+        // instead would make the choice depend on hash order.
+        for url in &self.priority {
+            let Some(health) = endpoints.get(url) else {
+                continue;
+            };
             let score = scores.get(url).copied().unwrap_or(INITIAL_SCORE);
             let last_success = health.last_success;
 
-            match (best_url.clone(), best_last_success) {
-                (None, _) => {
-                    best_url = Some(url.clone());
-                    best_score = score;
-                    best_last_success = last_success;
-                }
-                (Some(_), None) if last_success.is_some() => {
-                    best_url = Some(url.clone());
-                    best_score = score;
-                    best_last_success = last_success;
-                }
-                (Some(_), Some(best_time)) => {
-                    if score > best_score {
-                        best_url = Some(url.clone());
-                        best_score = score;
-                        best_last_success = last_success;
-                    } else if score == best_score {
-                        // Prefer more recently successful
-                        match last_success {
-                            Some(current_time) => {
-                                if current_time > best_time {
-                                    best_url = Some(url.clone());
-                                    best_score = score;
-                                    best_last_success = last_success;
-                                }
-                            }
-                            None => {
-                                // Keep the existing best if it has a last_success
-                            }
-                        }
-                    }
-                }
-                _ => {}
+            // Highest score wins outright; on a tie the more recently
+            // successful endpoint wins, and an endpoint that has ever
+            // succeeded beats one that never has. A pure tie leaves the
+            // incumbent in place, which is what makes priority order decide.
+            let better = match best_url {
+                None => true,
+                Some(_) if score != best_score => score > best_score,
+                Some(_) => match (last_success, best_last_success) {
+                    (Some(current), Some(best)) => current > best,
+                    (Some(_), None) => true,
+                    (None, _) => false,
+                },
+            };
+
+            if better {
+                best_url = Some(url);
+                best_score = score;
+                best_last_success = last_success;
             }
         }
 
@@ -289,6 +289,7 @@ impl RpcHealthScorer {
     }
 
     /// Get the current score for a specific endpoint.
+    #[allow(dead_code)]
     pub fn get_score(&self, url: &str) -> u8 {
         let scores = self.scores.read().expect("scores lock poisoned");
         scores.get(url).copied().unwrap_or(INITIAL_SCORE)
@@ -297,6 +298,7 @@ impl RpcHealthScorer {
     /// Get all current scores.
     ///
     /// Returns a map of endpoint URLs to their current scores.
+    #[allow(dead_code)]
     pub fn get_all_scores(&self) -> HashMap<String, u8> {
         let scores = self.scores.read().expect("scores lock poisoned");
         scores.clone()

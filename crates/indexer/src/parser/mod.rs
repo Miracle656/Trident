@@ -284,8 +284,8 @@ mod tests {
     use super::*;
     use base64::{engine::general_purpose::STANDARD, Engine};
     use stellar_xdr::curr::{
-        AccountId, ContractId, Hash, Int128Parts, Int256Parts, Limited, Limits, PublicKey,
-        ScAddress, ScMap, ScMapEntry, ScSymbol, ScVal, Uint256, VecM, WriteXdr,
+        AccountId, ContractId, Hash, Int128Parts, Limited, Limits, PublicKey, ScAddress, ScMap,
+        ScMapEntry, ScSymbol, ScVal, Uint256, VecM, WriteXdr,
     };
 
     use crate::rpc::RawEvent;
@@ -493,21 +493,28 @@ mod tests {
 
     #[test]
     fn large_i128_decoded_as_json_string() {
+        // i128::MAX — the largest value the decoder can represent, and well
+        // beyond the 2^53 range a JSON number can carry losslessly, so it must
+        // come back as a decimal string rather than a number.
         let v = ScVal::I128(Int128Parts {
-            hi: (170141183460469763414537442822368085504i128 >> 64) as i64,
-            lo: 1,
+            hi: (i128::MAX >> 64) as i64,
+            lo: u64::MAX,
         });
 
         let raw = make_event("contract", None, vec![], v, true);
-        let event = Parser::new(false).parse_event(&raw).unwrap().unwrap();
+        let event = Parser::new(false)
+            .parse_event_with_projection(&raw)
+            .unwrap()
+            .unwrap()
+            .event;
 
         assert!(
             event.data.is_string(),
-            "large i128 must be a JSON string, got: {event}"
+            "large i128 must be a JSON string, got: {event:?}"
         );
         assert_eq!(
             event.data.as_str().unwrap(),
-            "170141183460469763414537442822368085505",
+            "170141183460469231731687303715884105727",
             "exact decimal string must survive round-trip XDR -> JSON"
         );
     }
@@ -522,7 +529,11 @@ mod tests {
         });
 
         let raw = make_event("contract", None, vec![], v, true);
-        let event = Parser::new(false).parse_event(&raw).unwrap().unwrap();
+        let event = Parser::new(false)
+            .parse_event_with_projection(&raw)
+            .unwrap()
+            .unwrap()
+            .event;
 
         assert_eq!(
             event.data,
@@ -533,15 +544,21 @@ mod tests {
 
     #[test]
     fn i256_decoded_as_decimal_string() {
+        // -1 as a 256-bit two's-complement integer: every limb is all-ones.
+        // `hi_hi` is the signed high limb; the rest are unsigned.
         let v = ScVal::I256(stellar_xdr::curr::Int256Parts {
-            hi_hi: 0,
-            hi_lo: 0,
-            lo_hi: 0,
-            lo_lo: -1i32,
+            hi_hi: -1,
+            hi_lo: u64::MAX,
+            lo_hi: u64::MAX,
+            lo_lo: u64::MAX,
         });
 
         let raw = make_event("contract", None, vec![], v, true);
-        let event = Parser::new(false).parse_event(&raw).unwrap().unwrap();
+        let event = Parser::new(false)
+            .parse_event_with_projection(&raw)
+            .unwrap()
+            .unwrap()
+            .event;
 
         assert_eq!(
             event.data,
@@ -554,11 +571,15 @@ mod tests {
     fn small_i128_remains_json_number() {
         let v = ScVal::I128(Int128Parts { hi: 0, lo: 123 });
         let raw = make_event("contract", None, vec![], v, true);
-        let event = Parser::new(false).parse_event(&raw).unwrap().unwrap();
+        let event = Parser::new(false)
+            .parse_event_with_projection(&raw)
+            .unwrap()
+            .unwrap()
+            .event;
 
         assert!(
             event.data.is_number(),
-            "small i128 that fits in i64 should remain a JSON number: {event}",
+            "small i128 that fits in i64 should remain a JSON number: {event:?}",
         );
         assert_eq!(event.data, serde_json::json!(123));
     }

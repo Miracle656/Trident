@@ -11,8 +11,12 @@ pub struct Config {
     /// Prioritised RPC endpoints used for health-based failover (issue #213).
     pub stellar_rpc_urls: Vec<String>,
     /// Consecutive failures on the active endpoint before failing over (issue #213).
+    /// Read only by rpc::endpoints, which is currently unreferenced — see the
+    /// note at the top of that module.
+    #[allow(dead_code)]
     pub rpc_failover_threshold: u32,
     /// How long a failed endpoint is parked before it is probed again (issue #213).
+    #[allow(dead_code)]
     pub rpc_endpoint_cooldown: Duration,
     pub network: String,
     pub poll_interval: Duration,

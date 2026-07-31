@@ -55,6 +55,9 @@ pub const EVENTS_BY_CONTRACT_TOTAL: &str = "trident_indexer_events_by_contract_t
 pub const EVENT_DECODE_DURATION_SECONDS: &str = "trident_indexer_event_decode_duration_seconds";
 /// Health score (0-100) for each RPC endpoint. Label: `endpoint` (URL).
 pub const RPC_HEALTH_SCORE: &str = "trident_rpc_health_score";
+/// Indexer's own Postgres pool, documented in docs/metrics-catalog.md.
+pub const DB_POOL_SIZE: &str = "trident_indexer_db_pool_size";
+pub const DB_POOL_IDLE_CONNECTIONS: &str = "trident_indexer_db_pool_idle_connections";
 
 /// Install the global Prometheus recorder and start serving `/metrics` on
 /// `port`. Must be called once, before the streamer starts recording.
@@ -161,6 +164,8 @@ pub fn install(port: u16) -> Result<(), TridentError> {
     gauge!(LEDGER_LAG_SECONDS_ESTIMATED).set(0.0);
     gauge!(EFFECTIVE_POLL_INTERVAL_MS).set(0.0);
     gauge!(HEARTBEAT_TIMESTAMP).set(0.0);
+    gauge!(DB_POOL_SIZE).set(0.0);
+    gauge!(DB_POOL_IDLE_CONNECTIONS).set(0.0);
 
     tracing::info!(port, "Metrics endpoint listening");
     Ok(())
@@ -182,6 +187,23 @@ pub fn set_effective_poll_interval(ms: u64) {
 /// stalled-but-not-crashed indexer (#218).
 pub fn set_heartbeat_timestamp(secs: f64) {
     gauge!(HEARTBEAT_TIMESTAMP).set(secs);
+}
+
+/// Stamp the heartbeat to now. Convenience wrapper over
+/// [`set_heartbeat_timestamp`] for the poll loop, which has no reason to read
+/// the clock itself.
+pub fn record_heartbeat() {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+    set_heartbeat_timestamp(secs);
+}
+
+/// Publish the indexer's own Postgres pool utilisation (docs/metrics-catalog.md).
+pub fn set_db_pool_stats(size: u32, idle: u32) {
+    gauge!(DB_POOL_SIZE).set(size as f64);
+    gauge!(DB_POOL_IDLE_CONNECTIONS).set(idle as f64);
 }
 
 pub fn record_events_processed(count: u64) {
@@ -224,6 +246,8 @@ pub fn set_rpc_active_endpoint(index: usize) {
 }
 
 /// Count a switch to a different RPC endpoint (issue #213).
+/// Called only by rpc::endpoints, which is currently unreferenced.
+#[allow(dead_code)]
 pub fn record_rpc_failover() {
     counter!(RPC_FAILOVERS_TOTAL).increment(1);
 }

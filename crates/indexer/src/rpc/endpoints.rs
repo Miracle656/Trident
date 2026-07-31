@@ -1,5 +1,12 @@
 //! Prioritised RPC endpoint pool with health-based failover (issue #213).
 //!
+//! NOTE: currently unreferenced. `RpcClient` selects endpoints through
+//! `health::RpcHealthScorer` (dynamic scoring) instead of this ordered pool;
+//! the two landed from different branches and the scorer won. Kept rather than
+//! deleted because the cooldown/promotion behaviour here has no equivalent in
+//! the scorer — decide whether to port it over or drop this module.
+#![allow(dead_code)]
+//!
 //! The indexer's hard dependency is RPC availability: a single degraded or
 //! rate-limited provider directly becomes a data-freshness outage. This module
 //! keeps an ordered list of endpoints — index 0 is the primary — and hands the

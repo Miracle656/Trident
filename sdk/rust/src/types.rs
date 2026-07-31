@@ -4,6 +4,13 @@ use std::time::Duration;
 
 use crate::retry::RetryConfig;
 
+/// Environment variable consulted for the API key when
+/// [`TridentConfig::api_key`] is left empty.
+pub const ENV_API_KEY: &str = "TRIDENT_API_KEY";
+/// Environment variable consulted for the base URL when
+/// [`TridentConfig::api_url`] is left empty.
+pub const ENV_BASE_URL: &str = "TRIDENT_BASE_URL";
+
 /// Stellar network selection.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -151,6 +158,67 @@ pub struct PaginatedEvents {
     /// more pages exist.
     pub next_cursor: Option<String>,
     pub has_more: bool,
+}
+
+/// Query parameters for the contract-stats endpoint.
+#[derive(Debug, Default, Clone)]
+pub struct ContractStatsQuery {
+    pub from_ledger: Option<u64>,
+    pub to_ledger: Option<u64>,
+    pub network: Option<Network>,
+    pub limit: Option<u32>,
+}
+
+/// Per-dependency health, as reported by `GET /v1/health`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HealthChecks {
+    pub postgres: String,
+    pub redis: String,
+    #[serde(rename = "grpc_api")]
+    pub grpc_api: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HealthResponse {
+    pub status: String,
+    pub indexer_lag: Option<i64>,
+    pub checks: HealthChecks,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IndexerStatsResponse {
+    pub last_ledger_indexed: Option<i64>,
+    pub chain_tip_ledger: Option<i64>,
+    pub lag_ledgers: Option<i64>,
+    pub events_indexed_total: Option<i64>,
+    pub events_last_poll: Option<i64>,
+    pub avg_poll_duration_ms: Option<i64>,
+    pub last_poll_at: Option<String>,
+    pub status: String,
+    pub network: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContractStats {
+    pub contract_id: String,
+    pub event_count: i64,
+    pub last_seen_ledger: i64,
+    pub last_seen_at: String,
+    pub invocation_count: Option<i64>,
+    pub total_fee_charged: Option<i64>,
+    pub avg_fee_charged: Option<f64>,
+    pub avg_cpu_instructions: Option<f64>,
+    pub avg_read_bytes: Option<f64>,
+    pub avg_write_bytes: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContractStatsResponse {
+    pub contracts: Vec<ContractStats>,
+    pub from_ledger: i64,
+    pub to_ledger: i64,
+    pub network: String,
+    pub generated_at: String,
 }
 
 #[cfg(test)]
