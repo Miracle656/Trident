@@ -5,8 +5,9 @@
 # on. Without it the action cannot resolve a toolchain and every Rust job
 # fails at "Install Rust toolchain" before compiling anything.
 #
-# 1.85 is the floor: the Soroban contracts in contracts/ build for
-# wasm32v1-none, which older toolchains do not know about.
-channel = "1.90.0"
+# 1.94 is the floor, set by the strictest dependency rather than by choice:
+# sqlx-cli 0.9.0 (installed by the rust CI job) requires rustc 1.94.0, and
+# soroban-sdk 26.1.0 requires 1.91.0. Lower it only if both are relaxed.
+channel = "1.94.0"
 components = ["rustfmt", "clippy"]
 targets = ["wasm32v1-none"]

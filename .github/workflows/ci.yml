@@ -44,7 +44,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1482605bfc5719782e1267fd0c0cc350fe7646b8 # v1.74.0
         with:
-          toolchain: "1.90.0"
+          toolchain: "1.94.0"
           components: rustfmt, clippy
 
       # Check formatting first: it needs neither the Postgres service nor a
@@ -231,7 +231,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1482605bfc5719782e1267fd0c0cc350fe7646b8 # v1.74.0
         with:
-          toolchain: "1.90.0"
+          toolchain: "1.94.0"
       - name: Set up sccache
         uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
       - name: Cache Rust build artefacts
@@ -270,7 +270,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1482605bfc5719782e1267fd0c0cc350fe7646b8 # v1.74.0
         with:
-          toolchain: "1.90.0"
+          toolchain: "1.94.0"
           targets: wasm32v1-none
 
       # Shared with e2e-contract-events below via the same sccache GHA cache
@@ -370,7 +370,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1482605bfc5719782e1267fd0c0cc350fe7646b8 # v1.74.0
         with:
-          toolchain: "1.90.0"
+          toolchain: "1.94.0"
 
       # Shares the sccache object cache with the rust job (same workspace,
       # same Cargo.lock) so this job's build reuses objects already compiled
@@ -665,7 +665,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1482605bfc5719782e1267fd0c0cc350fe7646b8 # v1.74.0
         with:
-          toolchain: "1.90.0"
+          toolchain: "1.94.0"
           targets: wasm32v1-none
 
       # needs: [contracts, ...] above guarantees the contracts job (and its
@@ -923,6 +923,13 @@ jobs:
             --from-literal=REDIS_URL="redis://redis:6379" \
             --from-literal=ADMIN_API_KEY="ci-admin-key"
 
+      # migrations.enabled=false alongside the busybox image overrides: the
+      # migration Job is a pre-install hook, and Helm always waits on hooks
+      # regardless of --wait=false. It pulls the real migrate image and runs
+      # sqlx against postgres:5432, which does not exist in the kind cluster,
+      # so it can only ever burn the full --timeout and fail. This job checks
+      # that the chart renders and its resources are created, not that
+      # migrations run.
       - name: Install chart (CI values — nginx only, no image pull)
         run: |
           helm install trident helm/trident \
@@ -932,6 +939,7 @@ jobs:
             --set grpcApi.image.tag=latest \
             --set goApi.image.repository=busybox \
             --set goApi.image.tag=latest \
+            --set migrations.enabled=false \
             --wait=false \
             --timeout=60s
 

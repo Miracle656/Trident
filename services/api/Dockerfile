@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 
 # ── builder ──────────────────────────────────────────────────────────────────
-FROM golang:1.25-alpine@sha256:a7f2fc9834049c1f5df787690026a53738e55fc097cd8a4a93faa3e06c67ee32 AS builder
+FROM golang:1.25-alpine@sha256:56961d79ea8129efddcc0b8643fd8a5416b4e6228cfd477e3fd61deb2672c587 AS builder
 
 WORKDIR /build
 

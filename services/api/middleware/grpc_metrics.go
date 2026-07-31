@@ -57,26 +57,26 @@ func RecordGRPCClientCall(method, code string, seconds float64) {
 // WriteGRPCClientMetrics renders trident_api_grpc_client_requests_total and
 // trident_api_grpc_client_request_duration_seconds in Prometheus text format.
 func WriteGRPCClientMetrics(w io.Writer) {
-	fmt.Fprint(w, "# HELP trident_api_grpc_client_requests_total Total unary gRPC calls made to the internal events backend.\n")
-	fmt.Fprint(w, "# TYPE trident_api_grpc_client_requests_total counter\n")
-	fmt.Fprint(w, "# HELP trident_api_grpc_client_request_duration_seconds gRPC client call latency in seconds.\n")
-	fmt.Fprint(w, "# TYPE trident_api_grpc_client_request_duration_seconds histogram\n")
+	_, _ = fmt.Fprint(w, "# HELP trident_api_grpc_client_requests_total Total unary gRPC calls made to the internal events backend.\n")
+	_, _ = fmt.Fprint(w, "# TYPE trident_api_grpc_client_requests_total counter\n")
+	_, _ = fmt.Fprint(w, "# HELP trident_api_grpc_client_request_duration_seconds gRPC client call latency in seconds.\n")
+	_, _ = fmt.Fprint(w, "# TYPE trident_api_grpc_client_request_duration_seconds histogram\n")
 
 	grpcMetricsMu.Lock()
 	defer grpcMetricsMu.Unlock()
 
 	for key, series := range grpcMetricsData {
 		for i, bound := range grpcLatencyBuckets {
-			fmt.Fprintf(w, "trident_api_grpc_client_request_duration_seconds_bucket{method=%q,code=%q,le=%q} %d\n",
+			_, _ = fmt.Fprintf(w, "trident_api_grpc_client_request_duration_seconds_bucket{method=%q,code=%q,le=%q} %d\n",
 				key.method, key.code, formatBucketBound(bound), series.bucketCounts[i])
 		}
-		fmt.Fprintf(w, "trident_api_grpc_client_request_duration_seconds_bucket{method=%q,code=%q,le=\"+Inf\"} %d\n",
+		_, _ = fmt.Fprintf(w, "trident_api_grpc_client_request_duration_seconds_bucket{method=%q,code=%q,le=\"+Inf\"} %d\n",
 			key.method, key.code, series.count)
-		fmt.Fprintf(w, "trident_api_grpc_client_request_duration_seconds_sum{method=%q,code=%q} %g\n",
+		_, _ = fmt.Fprintf(w, "trident_api_grpc_client_request_duration_seconds_sum{method=%q,code=%q} %g\n",
 			key.method, key.code, series.sum)
-		fmt.Fprintf(w, "trident_api_grpc_client_request_duration_seconds_count{method=%q,code=%q} %d\n",
+		_, _ = fmt.Fprintf(w, "trident_api_grpc_client_request_duration_seconds_count{method=%q,code=%q} %d\n",
 			key.method, key.code, series.count)
-		fmt.Fprintf(w, "trident_api_grpc_client_requests_total{method=%q,code=%q} %d\n",
+		_, _ = fmt.Fprintf(w, "trident_api_grpc_client_requests_total{method=%q,code=%q} %d\n",
 			key.method, key.code, series.count)
 	}
 }
