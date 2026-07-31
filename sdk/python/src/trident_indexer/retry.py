@@ -11,7 +11,7 @@ import random
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
-from typing import Optional, Union
+from typing import Literal, Optional, Union
 
 
 @dataclass(frozen=True)
@@ -36,8 +36,11 @@ class RetryConfig:
 
 DEFAULT_RETRY_CONFIG = RetryConfig()
 
-# `None` means "no override, use the base"; `False` disables retries.
-RetryOverride = Optional[Union[RetryConfig, bool]]
+# `None` means "no override, use the base"; `False` disables retries. `True`
+# is deliberately not accepted — only `False` carries meaning here, and
+# admitting `bool` left a Literal[True] that resolve_retry_config could return
+# in place of a RetryConfig.
+RetryOverride = Optional[Union[RetryConfig, Literal[False]]]
 
 
 def resolve_retry_config(
@@ -80,6 +83,9 @@ def parse_retry_after_seconds(header_value: object) -> Optional[float]:
 
 def compute_backoff_seconds(attempt: int, cfg: RetryConfig) -> float:
     """Exponential backoff with optional full jitter, capped at max_delay."""
-    exp = cfg.base_delay * (2 ** (attempt - 1))
-    capped = min(exp, cfg.max_delay)
+    # `2 ** n` is typed Any (int ** int can yield float for a negative
+    # exponent), which propagates through the arithmetic and makes the return
+    # Any under --strict. Use float(...) to pin it.
+    exp: float = cfg.base_delay * float(2 ** (attempt - 1))
+    capped: float = min(exp, cfg.max_delay)
     return random.random() * capped if cfg.jitter else capped
