@@ -196,10 +196,22 @@ jobs:
     steps:
       - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
 
+      # curl's --retry only covers failures it deems transient (refused
+      # connections, timeouts, 5xx), so it gives up immediately on exit 56 —
+      # a connection accepted and then reset, which is exactly what a rolling
+      # deployment produces. An explicit loop retries on any failure, matching
+      # the e2e health checks in ci.yml (issue #388).
       - name: Health check
         run: |
-          curl --silent --fail --retry 10 --retry-delay 5 --retry-connrefused \
-            --max-time 10 "${{ vars.STAGING_URL }}/v1/health"
+          for attempt in $(seq 1 20); do
+            if curl --silent --fail --max-time 10 "${{ vars.STAGING_URL }}/v1/health"; then
+              echo "staging /v1/health returned 200 OK (attempt $attempt)"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::staging /v1/health did not return 200 within 100s"
+          exit 1
 
       - name: Query path (GET /v1/events)
         env:

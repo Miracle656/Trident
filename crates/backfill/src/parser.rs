@@ -48,6 +48,10 @@ pub struct RawEvent {
     pub paging_token: Option<String>,
     #[serde(rename = "txHash")]
     pub tx_hash: String,
+    /// Operation index within the transaction, added in stellar-rpc#383.
+    /// Absent on older servers, where the index was encoded in `id`.
+    #[serde(rename = "operationIndex", default)]
+    pub operation_index: Option<u32>,
     pub topic: Vec<String>,
     pub value: String,
     /// Deprecated upstream (stellar-rpc#4590); absent means not filtered out.
@@ -108,12 +112,17 @@ impl Parser {
             .parse()
             .map_err(|_| TridentError::parse(anyhow::anyhow!("invalid ledger: {}", raw.ledger)))?;
 
-        let event_index: u32 = raw
-            .id
-            .split('-')
-            .next_back()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
+        // Prefer the explicit operationIndex (stellar-rpc#383); the legacy
+        // `id` suffix is only correct on servers predating #382, which changed
+        // the `id` format and made this parse fall through to 0 for every
+        // event — colliding them all on the natural key (issue #388).
+        let event_index: u32 = raw.operation_index.unwrap_or_else(|| {
+            raw.id
+                .split('-')
+                .next_back()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0)
+        });
 
         Ok(Some(SorobanEvent {
             contract_id,

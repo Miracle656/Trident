@@ -658,12 +658,9 @@ impl Streamer {
                         );
                         metrics::record_parse_error();
                         let ledger_seq: u64 = raw.ledger.parse().unwrap_or(0);
-                        let event_idx: u32 = raw
-                            .id
-                            .split('-')
-                            .next_back()
-                            .and_then(|s| s.parse().ok())
-                            .unwrap_or(0);
+                        // Same derivation as the happy path so a parse_errors
+                        // row points at the event it actually came from.
+                        let event_idx: u32 = crate::parser::raw_event_index(raw);
                         let raw_payload = serde_json::to_string(&serde_json::json!({
                             "type": &raw.event_type,
                             "ledger": &raw.ledger,
