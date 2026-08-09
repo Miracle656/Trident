@@ -316,7 +316,30 @@ impl Streamer {
                             return Err(e);
                         }
                         Severity::Retryable => {
-                            tracing::warn!(error = %e, "Transient poll failure, will retry next interval");
+                            // A fresh index anchors at ledger 1, but the RPC
+                            // prunes old ledgers, so on a network whose retained
+                            // window has moved past 1 every poll is rejected
+                            // identically and the cursor never advances —
+                            // retrying alone can never clear it (issue #388).
+                            // Adopt the floor the error reports so the next poll
+                            // starts inside the retained window.
+                            match parse_retained_floor(&e.to_string()) {
+                                Some(floor) if cursor < floor.saturating_sub(1) => {
+                                    // page_request_params sends `cursor + 1`, so
+                                    // store floor - 1 to make the next request
+                                    // anchor exactly at the oldest retained ledger.
+                                    cursor = floor.saturating_sub(1);
+                                    tracing::warn!(
+                                        error = %e,
+                                        retained_floor = floor,
+                                        cursor,
+                                        "startLedger predates the RPC's retained history; advancing to the oldest retained ledger"
+                                    );
+                                }
+                                _ => {
+                                    tracing::warn!(error = %e, "Transient poll failure, will retry next interval");
+                                }
+                            }
                         }
                         Severity::Skip => {
                             tracing::warn!(error = %e, "Non-retryable poll failure, skipping cycle");
@@ -982,6 +1005,44 @@ fn page_request_params(cursor: u64, page_cursor: Option<&str>) -> (Option<u64>, 
     }
 }
 
+/// Extract the oldest retained ledger from an out-of-range `getEvents` error.
+///
+/// The Soroban RPC only keeps a recent window of ledgers. Asking for one it has
+/// already pruned fails with, verbatim:
+///
+/// ```text
+/// getEvents: RPC error -32600: startLedger must be within the ledger range: 7 - 457
+/// ```
+///
+/// There is no machine-readable field for the retained range — the same
+/// limitation noted for out-of-range cursors in `RpcClient::execute` — so the
+/// message is the only place the floor is available. Returns the lower bound
+/// (`7` above), or `None` when this is some other error.
+///
+/// Matching is deliberately narrow: both the `ledger range` phrase and a
+/// `<low> - <high>` pair must be present, so an unrelated RPC error can never
+/// be mistaken for a retention signal and silently move the cursor.
+fn parse_retained_floor(message: &str) -> Option<u64> {
+    let lower = message.to_lowercase();
+    if !lower.contains("ledger range") {
+        return None;
+    }
+    let after = &lower[lower.find("ledger range")? + "ledger range".len()..];
+    let (low, high) = after
+        .split_once('-')
+        .map(|(l, r)| (l.trim_matches(|c: char| !c.is_ascii_digit()), r))?;
+    let high: String = high
+        .trim_start()
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    let low: u64 = low.parse().ok()?;
+    let high: u64 = high.parse().ok()?;
+    // A well-formed range only; anything inverted means the message shape
+    // changed and the value should not be trusted.
+    (low <= high).then_some(low)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1036,6 +1097,53 @@ mod tests {
             page_request_params(100, Some("100-5")),
             (None, Some("100-5".to_string()))
         );
+    }
+
+    #[test]
+    fn retained_floor_parsed_from_the_real_rpc_message() {
+        // Verbatim from the E2E contract events job (issue #388): a fresh index
+        // anchored at ledger 1 against a network retaining only 7 onwards.
+        assert_eq!(
+            parse_retained_floor(
+                "getEvents: RPC error -32600: startLedger must be within the ledger range: 7 - 457"
+            ),
+            Some(7)
+        );
+    }
+
+    #[test]
+    fn retained_floor_ignores_unrelated_rpc_errors() {
+        // Anything that is not a retention complaint must not move the cursor.
+        assert_eq!(
+            parse_retained_floor("getEvents: RPC error -32602: invalid cursor"),
+            None
+        );
+        assert_eq!(parse_retained_floor("getEvents: empty result"), None);
+        assert_eq!(parse_retained_floor(""), None);
+    }
+
+    #[test]
+    fn retained_floor_rejects_a_malformed_range() {
+        // An inverted or truncated range means the message shape changed; the
+        // value must not be trusted rather than silently skipping ledgers.
+        assert_eq!(
+            parse_retained_floor("startLedger must be within the ledger range: 500 - 7"),
+            None
+        );
+        assert_eq!(
+            parse_retained_floor("startLedger must be within the ledger range: 7"),
+            None
+        );
+    }
+
+    #[test]
+    fn retained_floor_maps_to_a_cursor_that_anchors_on_the_floor() {
+        // The recovery stores floor - 1 because page_request_params sends
+        // cursor + 1; the next request must land exactly on the floor, not
+        // one past it (which would skip the oldest retained ledger).
+        let floor =
+            parse_retained_floor("startLedger must be within the ledger range: 7 - 457").unwrap();
+        assert_eq!(page_request_params(floor - 1, None), (Some(7), None));
     }
 
     fn sym_xdr(s: &str) -> String {
