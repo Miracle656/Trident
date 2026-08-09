@@ -64,6 +64,10 @@ pub struct RawEvent {
     pub paging_token: Option<String>,
     #[serde(rename = "txHash")]
     pub tx_hash: String,
+    /// Operation index within the transaction, added in stellar-rpc#383.
+    /// Absent on older servers, where the index was encoded in `id` instead.
+    #[serde(rename = "operationIndex", default)]
+    pub operation_index: Option<u32>,
     /// Ordered list of base64 XDR-encoded ScVal topic values.
     pub topic: Vec<String>,
     /// Base64 XDR-encoded ScVal event body.

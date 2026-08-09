@@ -726,6 +726,12 @@ impl Streamer {
                 }
             }
 
+            // Guarantee the natural key from migration 0025 holds across this
+            // batch before it reaches Postgres. Mutates event_index in place
+            // only, so the positional indices in `page_tokens` stay valid
+            // (issue #388).
+            crate::parser::assign_unique_event_indexes(&mut page_events);
+
             // One transaction for the whole page: events, cursor, and ledger
             // metadata land together or not at all, so a crash can never leave
             // the cursor ahead of the events it claims to cover (issue #199).

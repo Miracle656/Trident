@@ -118,13 +118,7 @@ impl Parser {
             .parse()
             .map_err(|_| TridentError::parse(anyhow::anyhow!("invalid ledger: {}", raw.ledger)))?;
 
-        // event_index is the second component of the opaque id string: "{encoded}-{index}"
-        let event_index: u32 = raw
-            .id
-            .split('-')
-            .next_back()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
+        let event_index = raw_event_index(raw);
 
         Ok(Some(ParsedEvent {
             event: SorobanEvent {
@@ -146,6 +140,61 @@ impl Parser {
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
+
+/// Position of an event within its transaction.
+///
+/// `soroban_events` carries a natural-key constraint on
+/// `(ledger_sequence, transaction_hash, event_index, network)` (migration
+/// 0025), so this must distinguish every event sharing a transaction or the
+/// batch insert aborts with a duplicate-key violation.
+///
+/// It used to be scraped off the tail of the opaque `id`, which was formatted
+/// `"{encoded}-{index}"`. stellar-rpc#382 changed `id`, so the parse silently
+/// fell through to `unwrap_or(0)` and stamped *every* event with 0, colliding
+/// the whole batch (issue #388).
+///
+/// stellar-rpc#383 added an explicit `operationIndex`, which is the correct
+/// source where available; servers predating it omit the field, so the legacy
+/// `id` suffix stays as the fallback, and 0 is the last resort.
+///
+/// A single operation can emit several events, so this alone is not guaranteed
+/// unique within a transaction — [`assign_unique_event_indexes`] resolves any
+/// remaining ties before insert.
+pub(crate) fn raw_event_index(raw: &RawEvent) -> u32 {
+    raw.operation_index
+        .or_else(|| {
+            raw.id
+                .split('-')
+                .next_back()
+                .and_then(|s| s.parse::<u32>().ok())
+        })
+        .unwrap_or(0)
+}
+
+/// Break ties so `(ledger_sequence, transaction_hash, event_index, network)`
+/// is unique across a batch, as migration 0025's constraint requires.
+///
+/// `raw_event_index` derives a position per event, but a single operation can
+/// emit several events, and older servers may not supply an index at all — in
+/// both cases two events in the same transaction land on the same value and
+/// the batch insert aborts with a duplicate-key violation (issue #388).
+///
+/// Walks the batch in order and, whenever a `(ledger, tx_hash, index)` triple
+/// repeats, advances the index to the next free slot. Events that already have
+/// distinct indices are left untouched, so behaviour against a server that
+/// reports them correctly is unchanged.
+pub(crate) fn assign_unique_event_indexes(events: &mut [SorobanEvent]) {
+    let mut seen: std::collections::HashSet<(u64, String, u32)> = std::collections::HashSet::new();
+    for event in events.iter_mut() {
+        while !seen.insert((
+            event.ledger_sequence,
+            event.transaction_hash.clone(),
+            event.event_index,
+        )) {
+            event.event_index = event.event_index.saturating_add(1);
+        }
+    }
+}
 
 fn parse_event_type(raw: &str) -> Result<EventType, TridentError> {
     match raw {
@@ -290,6 +339,65 @@ mod tests {
 
     use crate::rpc::RawEvent;
 
+    fn ev(ledger: u64, tx: &str, index: u32) -> SorobanEvent {
+        SorobanEvent {
+            contract_id: "C".to_string(),
+            topics: Vec::new(),
+            data: serde_json::json!(null),
+            ledger_sequence: ledger,
+            ledger_timestamp: "2026-08-09T20:00:00Z".to_string(),
+            transaction_hash: tx.to_string(),
+            event_index: index,
+            event_type: EventType::Contract,
+        }
+    }
+
+    #[test]
+    fn duplicate_event_indexes_within_a_transaction_are_separated() {
+        // Regression (#388): every event arrived with index 0, so the batch
+        // violated the (ledger, tx_hash, event_index, network) constraint from
+        // migration 0025 and no events were ever inserted.
+        let mut events = vec![ev(7, "aa", 0), ev(7, "aa", 0), ev(7, "aa", 0)];
+        assign_unique_event_indexes(&mut events);
+        let indexes: Vec<u32> = events.iter().map(|e| e.event_index).collect();
+        assert_eq!(indexes, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn distinct_event_indexes_are_left_alone() {
+        // A server that reports operationIndex correctly must not be perturbed.
+        let mut events = vec![ev(7, "aa", 0), ev(7, "aa", 1), ev(7, "aa", 2)];
+        assign_unique_event_indexes(&mut events);
+        let indexes: Vec<u32> = events.iter().map(|e| e.event_index).collect();
+        assert_eq!(indexes, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn the_key_is_scoped_per_transaction_and_ledger() {
+        // The constraint includes tx_hash and ledger, so the same index in a
+        // different transaction or ledger is legitimate and must be preserved.
+        let mut events = vec![ev(7, "aa", 0), ev(7, "bb", 0), ev(8, "aa", 0)];
+        assign_unique_event_indexes(&mut events);
+        let indexes: Vec<u32> = events.iter().map(|e| e.event_index).collect();
+        assert_eq!(indexes, vec![0, 0, 0]);
+    }
+
+    #[test]
+    fn event_index_prefers_operation_index_over_the_legacy_id_suffix() {
+        let mut raw = raw_event_fixture();
+        raw.id = "0000000000000000007-0000000009".to_string();
+        raw.operation_index = Some(3);
+        assert_eq!(raw_event_index(&raw), 3);
+    }
+
+    #[test]
+    fn event_index_falls_back_to_the_id_suffix_on_older_servers() {
+        let mut raw = raw_event_fixture();
+        raw.id = "0000000000000000007-0000000009".to_string();
+        raw.operation_index = None;
+        assert_eq!(raw_event_index(&raw), 9);
+    }
+
     fn xdr_b64(val: &ScVal) -> String {
         let mut buf = Vec::new();
         val.write_xdr(&mut Limited::new(&mut buf, Limits::none()))
@@ -316,10 +424,15 @@ mod tests {
             id: "0000000000500000-0".to_string(),
             paging_token: Some("token1".to_string()),
             tx_hash: "deadbeefdeadbeef".to_string(),
+            operation_index: None,
             topic: topics.iter().map(xdr_b64).collect(),
             value: xdr_b64(&value),
             in_successful_contract_call: successful,
         }
+    }
+
+    fn raw_event_fixture() -> RawEvent {
+        make_event("contract", Some("CA"), vec![], ScVal::Void, true)
     }
 
     #[test]
