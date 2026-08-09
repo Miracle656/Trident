@@ -12,7 +12,12 @@ use thiserror::Error;
 pub enum TridentError {
     /// Failure communicating with or parsing a response from Stellar RPC.
     /// Typically transient (timeouts, resets, 5xx) and therefore retryable.
-    #[error("RPC error{}: {source}", .ledger.map(|l| format!(" at ledger {l}")).unwrap_or_default())]
+    // `{source:#}` renders the whole anyhow context chain, not just the
+    // outermost layer. With plain `{source}` a transport failure built as
+    // `Error::new(err).context("getEvents")` logged only "RPC error: getEvents"
+    // and dropped the underlying cause, which made poll failures undiagnosable
+    // from CI logs alone (issue #388).
+    #[error("RPC error{}: {source:#}", .ledger.map(|l| format!(" at ledger {l}")).unwrap_or_default())]
     RpcError {
         #[source]
         source: anyhow::Error,
@@ -172,5 +177,27 @@ mod tests {
         let err = TridentError::rpc_at(anyhow::anyhow!("504"), 12345);
         assert!(err.to_string().contains("ledger 12345"));
         assert!(err.retryable());
+    }
+
+    #[test]
+    fn rpc_error_display_includes_the_whole_context_chain() {
+        // Regression (#388): transport failures are built as
+        // `Error::new(err).context("getEvents")`, and with a plain `{source}`
+        // the Display printed only "RPC error: getEvents" — the actual cause
+        // was dropped, leaving poll failures undiagnosable from logs.
+        let root = std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "connection reset by peer",
+        );
+        let err = TridentError::rpc(anyhow::Error::new(root).context("getEvents"));
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("getEvents"),
+            "outer context missing from: {rendered}"
+        );
+        assert!(
+            rendered.contains("connection reset by peer"),
+            "underlying cause missing from: {rendered}"
+        );
     }
 }
