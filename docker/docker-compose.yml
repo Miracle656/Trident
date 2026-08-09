@@ -126,6 +126,11 @@ services:
       PORT: ${PORT}
       API_KEY_SALT: ${API_KEY_SALT}
       API_KEY_HASHES: ${API_KEY_HASHES}
+      # Required: middleware.ValidateAllowedOrigins fails startup when this is
+      # unset. There is deliberately no default — a wildcard fallback here
+      # would silently disable CORS enforcement for every deployment.
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS}
+      CORS_DEV_MODE: ${CORS_DEV_MODE:-false}
       LOG_LEVEL: ${LOG_LEVEL}
     ports:
       - "${PORT}:${PORT}"

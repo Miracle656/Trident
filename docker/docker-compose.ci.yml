@@ -134,6 +134,8 @@ services:
       API_KEY_SALT: ${API_KEY_SALT}
       API_KEY_HASHES: ${API_KEY_HASHES}
       ADMIN_API_KEY: ${ADMIN_API_KEY:-}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS}
+      CORS_DEV_MODE: ${CORS_DEV_MODE:-false}
       LOG_LEVEL: ${LOG_LEVEL:-info}
     ports:
       - "${PORT:-3000}:${PORT:-3000}"
