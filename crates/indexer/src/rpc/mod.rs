@@ -14,13 +14,41 @@ pub use filters::{EventFilter, FilterPlan};
 use crate::metrics;
 use health::RpcHealthScorer;
 
+/// Deserialize a field that the RPC may send as either a JSON string or a
+/// JSON number, normalising both to `String`.
+///
+/// `getEvents` is inconsistent across Soroban RPC versions: older releases
+/// quote `ledger` (`"7"`), current ones send a bare integer (`7`). Typing the
+/// field as `String` therefore failed the whole page with
+/// `invalid type: integer 7, expected a string`, so no events were ever
+/// ingested against a modern RPC (issue #388). Accepting both keeps the
+/// existing `String` contract for callers while tolerating either wire shape.
+fn string_or_number<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StringOrNumber {
+        String(String),
+        Number(u64),
+    }
+
+    Ok(match StringOrNumber::deserialize(deserializer)? {
+        StringOrNumber::String(s) => s,
+        StringOrNumber::Number(n) => n.to_string(),
+    })
+}
+
 /// A single raw event as returned by the Stellar RPC `getEvents` method.
 /// Topics and data are base64-encoded XDR strings; the parser decodes them.
 #[derive(Debug, Deserialize)]
 pub struct RawEvent {
     #[serde(rename = "type")]
     pub event_type: String,
-    /// Ledger sequence number as a numeric string.
+    /// Ledger sequence number. Kept as a string because the RPC has sent it
+    /// both quoted and unquoted across versions; see [`string_or_number`].
+    #[serde(deserialize_with = "string_or_number")]
     pub ledger: String,
     #[serde(rename = "ledgerClosedAt")]
     pub ledger_closed_at: String,
@@ -627,6 +655,39 @@ mod tests {
     #[test]
     fn settings_build_a_client() {
         assert!(RpcHttpSettings::default().build_client().is_ok());
+    }
+
+    fn raw_event_json(ledger: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "type": "contract",
+            "ledger": ledger,
+            "ledgerClosedAt": "2026-08-09T18:59:36Z",
+            "contractId": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
+            "id": "0000000000000000000-0000000000",
+            "pagingToken": "0000000000000000000-0000000000",
+            "txHash": "aabb",
+            "topic": ["AAAADwAAAARtaW50"],
+            "value": "AAAACgAAAAAAAAAAAAAAAAAAAGQ=",
+            "inSuccessfulContractCall": true
+        })
+    }
+
+    #[test]
+    fn raw_event_accepts_an_unquoted_ledger_number() {
+        // Regression (#388): current Soroban RPC sends `"ledger": 7` as a bare
+        // integer. Typing the field as String failed the entire page with
+        // `invalid type: integer 7, expected a string`, so nothing was indexed.
+        let ev: RawEvent = serde_json::from_value(raw_event_json(serde_json::json!(7)))
+            .expect("unquoted ledger must deserialize");
+        assert_eq!(ev.ledger, "7");
+    }
+
+    #[test]
+    fn raw_event_still_accepts_a_quoted_ledger_string() {
+        // Older RPC releases quote it; both shapes must keep working.
+        let ev: RawEvent = serde_json::from_value(raw_event_json(serde_json::json!("7")))
+            .expect("quoted ledger must deserialize");
+        assert_eq!(ev.ledger, "7");
     }
 
     /// Mount an endpoint that always answers `getEvents` with an empty page.
