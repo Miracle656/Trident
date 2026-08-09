@@ -12,11 +12,12 @@ use thiserror::Error;
 pub enum TridentError {
     /// Failure communicating with or parsing a response from Stellar RPC.
     /// Typically transient (timeouts, resets, 5xx) and therefore retryable.
-    // `{source:#}` renders the whole anyhow context chain, not just the
-    // outermost layer. With plain `{source}` a transport failure built as
-    // `Error::new(err).context("getEvents")` logged only "RPC error: getEvents"
-    // and dropped the underlying cause, which made poll failures undiagnosable
-    // from CI logs alone (issue #388).
+    // Every variant renders its source with `{source:#}` — the whole anyhow
+    // context chain, not just the outermost layer. Sources here are built as
+    // `Error::new(err).context("some_op")`, and a plain `{source}` printed only
+    // "RPC error: getEvents" / "Storage error: insert_events_batch" while
+    // dropping the actual cause, which made failures undiagnosable from logs
+    // (issue #388).
     #[error("RPC error{}: {source:#}", .ledger.map(|l| format!(" at ledger {l}")).unwrap_or_default())]
     RpcError {
         #[source]
@@ -27,7 +28,7 @@ pub enum TridentError {
 
     /// Failure decoding or normalising raw XDR event data. A poison message —
     /// retrying will not help, so the item is skipped.
-    #[error("Parse error: {source}")]
+    #[error("Parse error: {source:#}")]
     ParseError {
         #[source]
         source: anyhow::Error,
@@ -35,7 +36,7 @@ pub enum TridentError {
 
     /// Failure reading from or writing to PostgreSQL or Redis. Connection-level
     /// failures are transient and retryable.
-    #[error("Storage error: {source}")]
+    #[error("Storage error: {source:#}")]
     StorageError {
         #[source]
         source: anyhow::Error,
@@ -43,7 +44,7 @@ pub enum TridentError {
 
     /// Missing or invalid configuration value. Fatal — the process cannot make
     /// progress and should halt.
-    #[error("Config error: {source}")]
+    #[error("Config error: {source:#}")]
     ConfigError {
         #[source]
         source: anyhow::Error,
@@ -180,24 +181,37 @@ mod tests {
     }
 
     #[test]
-    fn rpc_error_display_includes_the_whole_context_chain() {
-        // Regression (#388): transport failures are built as
-        // `Error::new(err).context("getEvents")`, and with a plain `{source}`
-        // the Display printed only "RPC error: getEvents" — the actual cause
-        // was dropped, leaving poll failures undiagnosable from logs.
-        let root = std::io::Error::new(
-            std::io::ErrorKind::ConnectionReset,
-            "connection reset by peer",
-        );
-        let err = TridentError::rpc(anyhow::Error::new(root).context("getEvents"));
-        let rendered = err.to_string();
-        assert!(
-            rendered.contains("getEvents"),
-            "outer context missing from: {rendered}"
-        );
-        assert!(
-            rendered.contains("connection reset by peer"),
-            "underlying cause missing from: {rendered}"
-        );
+    fn every_variant_display_includes_the_whole_context_chain() {
+        // Regression (#388): sources are built as
+        // `Error::new(err).context("some_op")`, and with a plain `{source}` the
+        // Display printed only the outer layer — "RPC error: getEvents",
+        // "Storage error: insert_events_batch" — dropping the actual cause and
+        // leaving failures undiagnosable from logs. Every variant must render
+        // the full chain, not just the one that was fixed first.
+        let chained = || {
+            let root = std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "connection reset by peer",
+            );
+            anyhow::Error::new(root).context("some_op")
+        };
+
+        for err in [
+            TridentError::rpc(chained()),
+            TridentError::rpc_at(chained(), 42),
+            TridentError::parse(chained()),
+            TridentError::storage(chained()),
+            TridentError::config(chained()),
+        ] {
+            let rendered = err.to_string();
+            assert!(
+                rendered.contains("some_op"),
+                "outer context missing from: {rendered}"
+            );
+            assert!(
+                rendered.contains("connection reset by peer"),
+                "underlying cause missing from: {rendered}"
+            );
+        }
     }
 }
