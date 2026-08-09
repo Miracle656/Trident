@@ -573,7 +573,7 @@ impl Streamer {
                 break;
             }
 
-            let last_paging_token = page.events.last().map(|e| e.paging_token.clone());
+            let last_paging_token = page.events.last().map(|e| e.page_cursor());
 
             let mut events_in_page: i32 = 0;
             let mut skipped_in_page: u64 = 0;

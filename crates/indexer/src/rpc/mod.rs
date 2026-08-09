@@ -55,16 +55,39 @@ pub struct RawEvent {
     #[serde(rename = "contractId")]
     pub contract_id: Option<String>,
     pub id: String,
-    #[serde(rename = "pagingToken")]
-    pub paging_token: String,
+    /// Removed from the RPC response in stellar-rpc v22 (stellar-rpc#382):
+    /// `id` identifies an individual event and the top-level `cursor` drives
+    /// pagination. Older servers still send it, so it stays optional rather
+    /// than failing the whole page on a modern one. Prefer
+    /// [`RawEvent::page_cursor`] over reading this directly.
+    #[serde(rename = "pagingToken", default)]
+    pub paging_token: Option<String>,
     #[serde(rename = "txHash")]
     pub tx_hash: String,
     /// Ordered list of base64 XDR-encoded ScVal topic values.
     pub topic: Vec<String>,
     /// Base64 XDR-encoded ScVal event body.
     pub value: String,
-    #[serde(rename = "inSuccessfulContractCall")]
+    /// Deprecated upstream and slated for removal (stellar-rpc#4590), so a
+    /// missing value must not fail the page. Absent means the event was not
+    /// filtered out, hence the `true` default.
+    #[serde(rename = "inSuccessfulContractCall", default = "default_true")]
     pub in_successful_contract_call: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl RawEvent {
+    /// The token to resume paging from after this event.
+    ///
+    /// Uses `pagingToken` when the server still sends it and falls back to
+    /// `id`, which stellar-rpc#382 designates as its replacement. Both are
+    /// accepted by the `cursor` request parameter.
+    pub fn page_cursor(&self) -> String {
+        self.paging_token.clone().unwrap_or_else(|| self.id.clone())
+    }
 }
 
 #[derive(Debug)]
@@ -663,7 +686,8 @@ mod tests {
             "ledger": ledger,
             "ledgerClosedAt": "2026-08-09T18:59:36Z",
             "contractId": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
-            "id": "0000000000000000000-0000000000",
+            // Deliberately different so tests can prove which one is used.
+            "id": "0000000000000000007-0000000001",
             "pagingToken": "0000000000000000000-0000000000",
             "txHash": "aabb",
             "topic": ["AAAADwAAAARtaW50"],
@@ -688,6 +712,41 @@ mod tests {
         let ev: RawEvent = serde_json::from_value(raw_event_json(serde_json::json!("7")))
             .expect("quoted ledger must deserialize");
         assert_eq!(ev.ledger, "7");
+    }
+
+    #[test]
+    fn raw_event_parses_without_paging_token_and_falls_back_to_id() {
+        // Regression (#388): stellar-rpc#382 removed pagingToken in favour of
+        // `id`. Requiring it failed the whole page against a current server.
+        let mut json = raw_event_json(serde_json::json!(7));
+        json.as_object_mut().unwrap().remove("pagingToken");
+        let ev: RawEvent =
+            serde_json::from_value(json).expect("missing pagingToken must deserialize");
+        assert_eq!(ev.paging_token, None);
+        assert_eq!(ev.page_cursor(), ev.id, "paging must fall back to id");
+    }
+
+    #[test]
+    fn raw_event_prefers_paging_token_when_the_server_sends_one() {
+        // Older servers still send it; it must win over id so paging behaviour
+        // against them is unchanged.
+        let ev: RawEvent = serde_json::from_value(raw_event_json(serde_json::json!(7)))
+            .expect("event must deserialize");
+        assert_eq!(ev.page_cursor(), "0000000000000000000-0000000000");
+        assert_ne!(ev.page_cursor(), ev.id);
+    }
+
+    #[test]
+    fn raw_event_defaults_in_successful_contract_call_when_absent() {
+        // Deprecated upstream (stellar-rpc#4590) and due for removal, so its
+        // absence must not fail the page or silently drop the event.
+        let mut json = raw_event_json(serde_json::json!(7));
+        json.as_object_mut()
+            .unwrap()
+            .remove("inSuccessfulContractCall");
+        let ev: RawEvent = serde_json::from_value(json)
+            .expect("missing inSuccessfulContractCall must deserialize");
+        assert!(ev.in_successful_contract_call);
     }
 
     /// Mount an endpoint that always answers `getEvents` with an empty page.

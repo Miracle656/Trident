@@ -314,7 +314,7 @@ mod tests {
             ledger_closed_at: "2024-06-01T00:00:00Z".to_string(),
             contract_id: contract_id.map(str::to_string),
             id: "0000000000500000-0".to_string(),
-            paging_token: "token1".to_string(),
+            paging_token: Some("token1".to_string()),
             tx_hash: "deadbeefdeadbeef".to_string(),
             topic: topics.iter().map(xdr_b64).collect(),
             value: xdr_b64(&value),

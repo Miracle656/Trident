@@ -7,24 +7,60 @@ use stellar_xdr::curr::{
 };
 use trident_common::{EventType, SorobanEvent, TridentError};
 
+/// Accept a field the RPC sends as either a JSON string or a JSON number.
+/// `ledger` is quoted on older servers and a bare integer on current ones;
+/// see the matching helper in `trident-indexer`'s rpc module.
+fn string_or_number<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StringOrNumber {
+        String(String),
+        Number(u64),
+    }
+
+    Ok(match StringOrNumber::deserialize(deserializer)? {
+        StringOrNumber::String(s) => s,
+        StringOrNumber::Number(n) => n.to_string(),
+    })
+}
+
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Deserialize, Debug, Clone)]
 pub struct RawEvent {
     #[serde(rename = "type")]
     pub event_type: String,
+    #[serde(deserialize_with = "string_or_number")]
     pub ledger: String,
     #[serde(rename = "ledgerClosedAt")]
     pub ledger_closed_at: String,
     #[serde(rename = "contractId")]
     pub contract_id: Option<String>,
     pub id: String,
-    #[serde(rename = "pagingToken")]
-    pub paging_token: String,
+    /// Removed in stellar-rpc v22 (stellar-rpc#382) in favour of `id`; kept
+    /// optional so older servers still parse. Use [`RawEvent::page_cursor`].
+    #[serde(rename = "pagingToken", default)]
+    pub paging_token: Option<String>,
     #[serde(rename = "txHash")]
     pub tx_hash: String,
     pub topic: Vec<String>,
     pub value: String,
-    #[serde(rename = "inSuccessfulContractCall")]
+    /// Deprecated upstream (stellar-rpc#4590); absent means not filtered out.
+    #[serde(rename = "inSuccessfulContractCall", default = "default_true")]
     pub in_successful_contract_call: bool,
+}
+
+impl RawEvent {
+    /// Token to resume paging from, preferring `pagingToken` when present and
+    /// falling back to `id`, its designated replacement.
+    pub fn page_cursor(&self) -> String {
+        self.paging_token.clone().unwrap_or_else(|| self.id.clone())
+    }
 }
 
 pub struct EventsPage {

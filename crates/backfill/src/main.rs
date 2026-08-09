@@ -159,7 +159,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 break;
                             }
 
-                            page_cursor = page.events.last().map(|e| e.paging_token.clone());
+                            page_cursor = page.events.last().map(|e| e.page_cursor());
 
                             if rpc_delay > 0 {
                                 sleep(Duration::from_millis(rpc_delay)).await;
