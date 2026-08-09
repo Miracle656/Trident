@@ -581,21 +581,30 @@ jobs:
             up -d
 
       - name: Wait for Go API to become healthy
-        # Poll GET /v1/health until it returns 200 or we exhaust retries.
-        # --retry-connrefused keeps retrying even when the port is not yet
-        # open; --retry-delay 3 gives each service time to initialise.
+        # Poll GET /v1/health until it returns 200 or the budget runs out.
+        #
+        # curl's own --retry is not enough here. It retries only failures it
+        # considers transient — refused connections (with --retry-connrefused),
+        # timeouts, and 5xx — so it gives up immediately on exit 56 ("failure
+        # receiving network data"). That is precisely the race this step exists
+        # to absorb: docker's port forward accepts the connection a moment
+        # before the API binds the port, so the connection is established and
+        # then reset. The step then failed in the same second it started,
+        # having never retried at all.
+        #
+        # An explicit loop retries on any failure, which is the intent.
         run: |
           echo "Waiting for /v1/health to return 200..."
-          curl \
-            --silent \
-            --fail \
-            --retry 20 \
-            --retry-delay 5 \
-            --retry-connrefused \
-            --max-time 10 \
-            http://localhost:3000/v1/health
-          echo ""
-          echo "/v1/health returned 200 OK"
+          for attempt in $(seq 1 40); do
+            if curl --silent --fail --max-time 10 http://localhost:3000/v1/health; then
+              echo ""
+              echo "/v1/health returned 200 OK (attempt $attempt)"
+              exit 0
+            fi
+            sleep 3
+          done
+          echo "::error::/v1/health did not return 200 within 120s"
+          exit 1
 
       # Without this the job reports only curl's exit code, which says nothing
       # about which service failed to come up. Runs only on failure.
@@ -860,10 +869,20 @@ jobs:
             --env-file .env.ci \
             up -d --build
 
+      # Same retry-loop rationale as the smoke-test job above: curl's --retry
+      # does not cover exit 56, which is the failure this race actually
+      # produces.
       - name: Wait for Go API to become healthy
         run: |
-          curl --silent --fail --retry 20 --retry-delay 5 --retry-connrefused \
-            --max-time 10 http://localhost:3000/v1/health
+          for attempt in $(seq 1 40); do
+            if curl --silent --fail --max-time 10 http://localhost:3000/v1/health; then
+              echo "/v1/health returned 200 OK (attempt $attempt)"
+              exit 0
+            fi
+            sleep 3
+          done
+          echo "::error::/v1/health did not return 200 within 120s"
+          exit 1
 
       # Same rationale as the smoke-test job: curl's exit code alone does not
       # identify which service failed to start.
