@@ -71,7 +71,7 @@ function filterUrl(overrides: Record<string, string>): string {
 >
   <!-- Breadcrumb -->
   <nav class="text-xs text-gray-500 mb-6 flex items-center gap-1.5" aria-label="Breadcrumb">
-    <a href={`/?network=${network}`} class="hover:text-white">Home</a>
+    <a href={`/explorer?network=${network}`} class="hover:text-white">Explorer</a>
     <span>/</span>
     <span class="text-gray-300 font-mono" title={address}>{shortAddr}</span>
   </nav>
@@ -99,6 +99,10 @@ function filterUrl(overrides: Record<string, string>): string {
           }`}
         >
           {network}
+        </span>
+        <span id="stream-status" class="flex items-center gap-1.5" hidden>
+          <span id="stream-dot" class="w-1.5 h-1.5 rounded-full bg-gray-500"></span>
+          <span id="stream-label">Connecting</span>
         </span>
       </div>
     </div>
@@ -354,5 +358,127 @@ function filterUrl(overrides: Record<string, string>): string {
         loadMoreLink.removeAttribute('disabled');
       }
     });
+  }
+</script>
+
+<script>
+  import { subscribeToContract } from '../../../lib/stream';
+  import type { StreamEvent, StreamStatus } from '../../../lib/stream';
+
+  // Live stream: prepend new events as they are indexed. Only on the first,
+  // unfiltered-by-ledger page — a cursor or ledger-range view is a historical
+  // snapshot and silently mixing live rows into it would falsify the filter.
+  const params = new URLSearchParams(window.location.search);
+  const contractId = decodeURIComponent(window.location.pathname.split('/')[2] ?? '');
+  const network = params.get('network') === 'mainnet' ? 'mainnet' : 'testnet';
+  const topic0 = params.get('topic0') ?? '';
+  const isSnapshot =
+    params.get('cursor') !== null ||
+    params.get('ledgerFrom') !== null ||
+    params.get('ledgerTo') !== null;
+
+  const tbody = document.getElementById('events-tbody') as HTMLTableSectionElement | null;
+  const statusEl = document.getElementById('stream-status');
+  const dotEl = document.getElementById('stream-dot');
+  const labelEl = document.getElementById('stream-label');
+
+  const MAX_ROWS = 200;
+  const seen = new Set<string>();
+
+  function setStatus(status: StreamStatus): void {
+    if (!statusEl || !dotEl || !labelEl) return;
+    statusEl.hidden = false;
+    const dot = {
+      connecting: 'w-1.5 h-1.5 rounded-full bg-gray-500 animate-pulse',
+      live: 'w-1.5 h-1.5 rounded-full bg-green-500',
+      disconnected: 'w-1.5 h-1.5 rounded-full bg-red-500',
+    }[status];
+    const label = {
+      connecting: 'Connecting',
+      live: 'Live',
+      disconnected: 'Live stream offline',
+    }[status];
+    dotEl.className = dot;
+    labelEl.textContent = label;
+  }
+
+  function cell(className: string, child: Node | string): HTMLTableCellElement {
+    const td = document.createElement('td');
+    td.className = className;
+    td.append(child);
+    return td;
+  }
+
+  function buildRow(e: StreamEvent): HTMLTableRowElement {
+    const tr = document.createElement('tr');
+    tr.className = 'hover:bg-gray-900/60 transition-colors';
+
+    const time = document.createElement('td');
+    time.className = 'px-4 py-3 text-gray-400 whitespace-nowrap text-xs';
+    time.title = e.ledger_timestamp;
+    time.textContent = 'just now';
+    tr.append(time);
+
+    tr.append(cell('px-4 py-3 font-mono text-gray-300 text-xs', String(e.ledger_sequence)));
+
+    const badge = document.createElement('span');
+    badge.className = 'px-2 py-0.5 rounded-full text-xs bg-green-900/50 text-green-300 font-medium';
+    badge.textContent = e.topics[0] ?? e.event_type;
+    tr.append(cell('px-4 py-3', badge));
+
+    tr.append(
+      cell(
+        'px-4 py-3 font-mono text-gray-400 text-xs truncate max-w-[180px] hidden md:table-cell',
+        e.topics[1] ? `${e.topics[1].slice(0, 20)}...` : '—'
+      )
+    );
+
+    const txLink = document.createElement('a');
+    txLink.href = `${
+      network === 'mainnet'
+        ? 'https://stellar.expert/explorer/public'
+        : 'https://stellar.expert/explorer/testnet'
+    }/tx/${encodeURIComponent(e.transaction_hash)}`;
+    txLink.target = '_blank';
+    txLink.rel = 'noopener noreferrer';
+    txLink.className = 'font-mono text-xs text-gray-400 hover:text-indigo-300';
+    txLink.textContent = `${e.transaction_hash.slice(0, 8)}...${e.transaction_hash.slice(-6)}`;
+    tr.append(cell('px-4 py-3 hidden lg:table-cell', txLink));
+
+    tr.append(
+      cell(
+        'px-4 py-3 hidden xl:table-cell font-mono text-xs text-gray-500 max-w-[200px] truncate',
+        e.data ? e.data.slice(0, 60) : '—'
+      )
+    );
+
+    if (e.event_id) {
+      tr.dataset.href = `/contract/${contractId}/event/${encodeURIComponent(e.event_id)}?network=${network}`;
+      tr.classList.add('cursor-pointer');
+      tr.addEventListener('click', (evt) => {
+        if ((evt.target as HTMLElement).closest('a')) return;
+        window.location.href = tr.dataset.href ?? '#';
+      });
+    }
+    return tr;
+  }
+
+  if (tbody && !isSnapshot && contractId) {
+    const handle = subscribeToContract({
+      contractId,
+      network,
+      topic0: topic0 || undefined,
+      onStatus: setStatus,
+      onEvent: (e) => {
+        const key = e.event_id ?? `${e.ledger_sequence}:${e.transaction_hash}:${e.event_index}`;
+        if (seen.has(key)) return;
+        seen.add(key);
+        tbody.prepend(buildRow(e));
+        while (tbody.rows.length > MAX_ROWS) {
+          tbody.deleteRow(tbody.rows.length - 1);
+        }
+      },
+    });
+    window.addEventListener('pagehide', () => handle.close());
   }
 </script>
