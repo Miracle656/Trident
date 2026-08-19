@@ -1,0 +1,32 @@
+/* Landing-page styles. The Tailwind directives are injected by
+   @astrojs/tailwind; this file only carries what utilities cannot express. */
+
+.gradient-text {
+  background-image: linear-gradient(
+    100deg,
+    #ff4a1f 0%,
+    #ff6a42 35%,
+    #2fd575 100%
+  );
+  background-size: 200% auto;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  animation: gradient-pan 8s ease infinite;
+}
+
+@keyframes gradient-pan {
+  0% { background-position: 0% 50%; }
+  50% { background-position: 100% 50%; }
+  100% { background-position: 0% 50%; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .gradient-text {
+    animation: none;
+    background-position: 50% 50%;
+  }
+  html {
+    scroll-behavior: auto;
+  }
+}
