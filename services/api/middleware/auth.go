@@ -102,7 +102,11 @@ func NewDBAuth(cfg DBAuthConfig) func(http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			// Public paths — skip auth entirely.
 			path := r.URL.Path
-			if path == "/v1/health" || path == "/v1/ready" || path == "/metrics" {
+			// /v1/stats/indexer is the public data-freshness contract
+			// (security: [] in api/openapi.yaml) — rate-limited by IP, never
+			// key-gated.
+			if path == "/v1/health" || path == "/v1/ready" || path == "/metrics" ||
+				path == "/v1/stats/indexer" {
 				next.ServeHTTP(w, r)
 				return
 			}
@@ -185,7 +189,8 @@ func Validator(hashes map[string]struct{}) func(string) bool {
 // pass through (auth is disabled — suitable for local development).
 func Auth(validHashes map[string]struct{}, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodGet && r.URL.Path == "/v1/health" {
+		if r.Method == http.MethodGet &&
+			(r.URL.Path == "/v1/health" || r.URL.Path == "/v1/stats/indexer") {
 			next.ServeHTTP(w, r)
 			return
 		}
