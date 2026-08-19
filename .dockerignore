@@ -1,0 +1,13 @@
+# Keep the build context small: docker/docker-compose*.yml build the service
+# images with the repo root as context (Dockerfiles COPY repo-root-relative
+# paths), so without this file every local build ships multi-GB build
+# artifacts to the daemon. CI checkouts are clean, which is why this was
+# never noticed there.
+.git
+target
+**/node_modules
+**/dist
+explorer/.astro
+sdk/typescript/coverage
+sdk/react/coverage
+.planning
