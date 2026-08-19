@@ -100,7 +100,7 @@ function filterUrl(overrides: Record<string, string>): string {
         >
           {network}
         </span>
-        <span id="stream-status" class="flex items-center gap-1.5" hidden>
+        <span id="stream-status" class="hidden items-center gap-1.5">
           <span id="stream-dot" class="w-1.5 h-1.5 rounded-full bg-gray-500"></span>
           <span id="stream-label">Connecting</span>
         </span>
@@ -387,7 +387,8 @@ function filterUrl(overrides: Record<string, string>): string {
 
   function setStatus(status: StreamStatus): void {
     if (!statusEl || !dotEl || !labelEl) return;
-    statusEl.hidden = false;
+    statusEl.classList.remove('hidden');
+    statusEl.classList.add('flex');
     const dot = {
       connecting: 'w-1.5 h-1.5 rounded-full bg-gray-500 animate-pulse',
       live: 'w-1.5 h-1.5 rounded-full bg-green-500',
