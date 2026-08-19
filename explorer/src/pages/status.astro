@@ -1,0 +1,182 @@
+---
+import Base from '../layouts/Base.astro';
+import { getIndexerStats } from '../lib/api';
+import type { IndexerStats, Network } from '../lib/types';
+
+const rawNetwork = Astro.url.searchParams.get('network');
+const network: Network = rawNetwork === 'mainnet' ? 'mainnet' : 'testnet';
+
+let stats: IndexerStats | null = null;
+let unreachable = false;
+try {
+  stats = await getIndexerStats(network);
+} catch {
+  unreachable = true;
+}
+
+// Every numeric field is nullable in the API contract — always fall back to
+// an em dash, never render null/NaN/undefined.
+function num(v: number | null | undefined): string {
+  return v == null ? '—' : v.toLocaleString('en-US');
+}
+
+function staleness(seconds: number | null | undefined): string {
+  if (seconds == null) return '—';
+  if (seconds < 60) return `about ${Math.round(seconds)}s behind`;
+  const m = Math.round(seconds / 60);
+  if (m < 60) return `about ${m}m behind`;
+  const h = Math.round(m / 60);
+  return `about ${h}h behind`;
+}
+
+const statusStyles: Record<string, { dot: string; text: string; label: string }> = {
+  healthy: { dot: 'bg-green-500', text: 'text-green-400', label: 'Healthy' },
+  lagging: { dot: 'bg-ember-500', text: 'text-ember-400', label: 'Lagging' },
+  stalled: { dot: 'bg-red-600', text: 'text-red-500', label: 'Stalled' },
+  unreachable: { dot: 'bg-red-700', text: 'text-red-500', label: 'Indexer unreachable' },
+};
+
+const currentKey = unreachable ? 'unreachable' : (stats?.status ?? 'unreachable');
+const current = statusStyles[currentKey] ?? statusStyles.unreachable;
+---
+
+<Base
+  title="Indexer Status"
+  description="Live health of the Trident indexer: last indexed ledger, chain tip, and data freshness."
+>
+  <section class="max-w-2xl mx-auto py-10">
+    <div class="flex items-center justify-between mb-8">
+      <h1 class="text-2xl font-bold text-white">Indexer status</h1>
+      <div class="flex gap-2 text-sm" role="group" aria-label="Network selector">
+        <a
+          href="?network=testnet"
+          class={`px-3 py-1 rounded-full transition-colors ${
+            network === 'testnet' ? 'bg-gray-800 text-white' : 'text-gray-500 hover:text-white'
+          }`}
+          aria-current={network === 'testnet' ? 'true' : undefined}>Testnet</a
+        >
+        <a
+          href="?network=mainnet"
+          class={`px-3 py-1 rounded-full transition-colors ${
+            network === 'mainnet' ? 'bg-gray-800 text-white' : 'text-gray-500 hover:text-white'
+          }`}
+          aria-current={network === 'mainnet' ? 'true' : undefined}>Mainnet</a
+        >
+      </div>
+    </div>
+
+    <div
+      id="status-card"
+      class="rounded-xl border border-gray-800 bg-gray-900 p-6"
+      data-network={network}
+    >
+      <div class="flex items-center gap-3">
+        <span id="status-dot" class={`h-3 w-3 rounded-full ${current.dot}`} aria-hidden="true"
+        ></span>
+        <span id="status-label" class={`text-lg font-semibold ${current.text}`}>
+          {current.label}
+        </span>
+        <span id="status-network" class="ml-auto text-xs text-gray-500">
+          {stats?.network ?? network}
+        </span>
+      </div>
+
+      <dl class="mt-6 grid grid-cols-1 sm:grid-cols-2 gap-x-8 gap-y-5 text-sm">
+        <div>
+          <dt class="text-gray-500">Last ledger indexed</dt>
+          <dd id="stat-last" class="mt-1 font-mono text-white text-base">
+            {num(stats?.last_ledger_indexed)}
+          </dd>
+        </div>
+        <div>
+          <dt class="text-gray-500">Chain tip ledger</dt>
+          <dd id="stat-tip" class="mt-1 font-mono text-white text-base">
+            {num(stats?.chain_tip_ledger)}
+          </dd>
+        </div>
+        <div>
+          <dt class="text-gray-500">Ledger gap</dt>
+          <dd id="stat-lag" class="mt-1 font-mono text-white text-base">
+            {num(stats?.lag_ledgers)}
+          </dd>
+        </div>
+        <div>
+          <dt class="text-gray-500">Data freshness</dt>
+          <dd id="stat-fresh" class="mt-1 text-white text-base">
+            {staleness(stats?.lag_seconds_estimated)}
+          </dd>
+        </div>
+      </dl>
+    </div>
+
+    <p class="mt-4 text-xs text-gray-500 text-right" id="refresh-note">Refreshes every 10s</p>
+  </section>
+</Base>
+
+<script>
+  import type { IndexerStats } from '../lib/types';
+
+  const card = document.getElementById('status-card');
+  const network = card?.dataset.network ?? 'testnet';
+
+  const dot = document.getElementById('status-dot');
+  const label = document.getElementById('status-label');
+  const netEl = document.getElementById('status-network');
+  const last = document.getElementById('stat-last');
+  const tip = document.getElementById('stat-tip');
+  const lag = document.getElementById('stat-lag');
+  const fresh = document.getElementById('stat-fresh');
+
+  const styles: Record<string, { dot: string; text: string; label: string }> = {
+    healthy: { dot: 'bg-green-500', text: 'text-green-400', label: 'Healthy' },
+    lagging: { dot: 'bg-ember-500', text: 'text-ember-400', label: 'Lagging' },
+    stalled: { dot: 'bg-red-600', text: 'text-red-500', label: 'Stalled' },
+    unreachable: { dot: 'bg-red-700', text: 'text-red-500', label: 'Indexer unreachable' },
+  };
+
+  function num(v: number | null | undefined): string {
+    return v == null ? '—' : v.toLocaleString('en-US');
+  }
+
+  function staleness(seconds: number | null | undefined): string {
+    if (seconds == null) return '—';
+    if (seconds < 60) return `about ${Math.round(seconds)}s behind`;
+    const m = Math.round(seconds / 60);
+    if (m < 60) return `about ${m}m behind`;
+    const h = Math.round(m / 60);
+    return `about ${h}h behind`;
+  }
+
+  function render(key: string, stats: IndexerStats | null): void {
+    const s = styles[key] ?? styles.unreachable;
+    if (dot) dot.className = `h-3 w-3 rounded-full ${s.dot}`;
+    if (label) {
+      label.className = `text-lg font-semibold ${s.text}`;
+      label.textContent = s.label;
+    }
+    if (netEl) netEl.textContent = stats?.network ?? network;
+    if (last) last.textContent = num(stats?.last_ledger_indexed);
+    if (tip) tip.textContent = num(stats?.chain_tip_ledger);
+    if (lag) lag.textContent = num(stats?.lag_ledgers);
+    if (fresh) fresh.textContent = staleness(stats?.lag_seconds_estimated);
+  }
+
+  async function refresh(): Promise<void> {
+    try {
+      const res = await fetch(`/api/status.json?network=${network}`);
+      if (!res.ok) {
+        render('unreachable', null);
+        return;
+      }
+      const stats = (await res.json()) as IndexerStats;
+      render(stats.status, stats);
+    } catch {
+      render('unreachable', null);
+    }
+  }
+
+  const id = setInterval(refresh, 10_000);
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) clearInterval(id);
+  });
+</script>
