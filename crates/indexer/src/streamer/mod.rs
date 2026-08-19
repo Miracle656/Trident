@@ -325,10 +325,20 @@ impl Streamer {
                             // starts inside the retained window.
                             match parse_retained_floor(&e.to_string()) {
                                 Some(floor) if cursor < floor.saturating_sub(1) => {
-                                    // page_request_params sends `cursor + 1`, so
-                                    // store floor - 1 to make the next request
-                                    // anchor exactly at the oldest retained ledger.
-                                    cursor = floor.saturating_sub(1);
+                                    // page_request_params sends `cursor + 1`. Do
+                                    // NOT anchor exactly at the floor: the floor
+                                    // advances by a few ledgers while the loop
+                                    // sleeps between polls, so an exact anchor
+                                    // is rejected again next cycle and the
+                                    // streamer chases the retention edge forever
+                                    // without ingesting anything. Land a margin
+                                    // inside the window instead — ledgers at the
+                                    // very edge are being pruned as we speak, so
+                                    // they are lost either way.
+                                    const RETAINED_FLOOR_MARGIN: u64 = 60;
+                                    cursor = floor
+                                        .saturating_sub(1)
+                                        .saturating_add(RETAINED_FLOOR_MARGIN);
                                     tracing::warn!(
                                         error = %e,
                                         retained_floor = floor,
