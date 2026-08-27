@@ -16,7 +16,17 @@ RUN go mod download
 
 # Copy source and build the binary.
 COPY services/api/ ./
-RUN CGO_ENABLED=0 GOOS=linux go build -o /api .
+
+# Build arguments for version information (issue #397).
+ARG VERSION=dev
+ARG COMMIT_SHA=unknown
+ARG BUILD_TIME=unknown
+
+RUN CGO_ENABLED=0 GOOS=linux go build \
+    -ldflags="-X 'github.com/Depo-dev/trident/services/api/handlers.Version=${VERSION}' \
+              -X 'github.com/Depo-dev/trident/services/api/handlers.CommitSHA=${COMMIT_SHA}' \
+              -X 'github.com/Depo-dev/trident/services/api/handlers.BuildTime=${BUILD_TIME}'" \
+    -o /api .
 
 # ── runtime ──────────────────────────────────────────────────────────────────
 # Was pinned to a stale alpine:3.19 digest, so the runtime image kept

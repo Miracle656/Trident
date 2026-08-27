@@ -43,6 +43,11 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.global.existingSecret }}
                   key: REDIS_URL
+            - name: STELLAR_RPC_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.global.existingSecret }}
+                  key: STELLAR_RPC_URL
             {{- range $k, $v := .Values.indexer.env }}
             - name: {{ $k }}
               value: {{ $v | quote }}

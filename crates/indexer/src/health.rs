@@ -70,6 +70,12 @@ async fn handle_conn(stream: tokio::net::TcpStream, db: PgPool, redis_url: Strin
             let (code, phrase, body) = readyz(&db, &redis_url).await;
             (code, phrase, "text/plain", body)
         }
+        // Admin endpoint: return recent dead-lettered (parse error) events
+        // for operational inspection (issue #414).
+        "/admin/dead-letter" => {
+            let (code, phrase, body) = dead_letter_summary(&db).await;
+            (code, phrase, "application/json", body)
+        }
         _ => (404, "Not Found", "text/plain", "not found\n".into()),
     };
 
@@ -119,4 +125,48 @@ async fn check_redis(redis_url: &str) -> bool {
             .is_ok(),
         Err(_) => false,
     }
+}
+
+/// Return the 20 most recent dead-lettered events as a JSON array.
+async fn dead_letter_summary(db: &PgPool) -> (u16, &'static str, String) {
+    match sqlx::query_as::<_, DeadLetterRow>(
+        r#"SELECT id, ledger_sequence, event_index, error_message, created_at
+           FROM parse_errors
+           ORDER BY id DESC
+           LIMIT 20"#,
+    )
+    .fetch_all(db)
+    .await
+    {
+        Ok(rows) => {
+            let entries: Vec<serde_json::Value> = rows
+                .iter()
+                .map(|r| {
+                    serde_json::json!({
+                        "id": r.id,
+                        "ledger_sequence": r.ledger_sequence,
+                        "event_index": r.event_index,
+                        "error_message": r.error_message,
+                        "created_at": r.created_at,
+                    })
+                })
+                .collect();
+            let body = serde_json::to_string(&entries).unwrap_or_else(|_| "[]".into());
+            (200, "OK", body)
+        }
+        Err(e) => (
+            500,
+            "Internal Server Error",
+            format!("{{\"error\": \"{e}\"}}"),
+        ),
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct DeadLetterRow {
+    id: i64,
+    ledger_sequence: i64,
+    event_index: i32,
+    error_message: String,
+    created_at: chrono::NaiveDateTime,
 }

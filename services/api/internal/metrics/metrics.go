@@ -52,6 +52,20 @@ var (
 		Help: "Total WebSocket subscriber registrations since startup.",
 	})
 
+	// Webhook delivery observability (issue #454). The per-subscription and
+	// global concurrency caps only help if an operator can see them binding —
+	// without these, a saturated delivery pool and a healthy one look
+	// identical from outside.
+	WebhookDeliveriesTotal = promauto.With(Registry).NewCounterVec(prometheus.CounterOpts{
+		Name: "trident_webhook_deliveries_total",
+		Help: "Webhook delivery attempts by outcome.",
+	}, []string{"outcome"}) // outcome: success|failure|skipped_in_flight|blocked_url
+
+	WebhookDeliveriesInFlight = promauto.With(Registry).NewGauge(prometheus.GaugeOpts{
+		Name: "trident_webhook_deliveries_in_flight",
+		Help: "Webhook deliveries currently executing, bounded by the global delivery semaphore.",
+	})
+
 	WSDisconnectsTotal = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "trident_ws_disconnects_total",
 		Help: "Total WebSocket subscriber unregistrations since startup.",
@@ -77,6 +91,11 @@ var (
 		Name: "trident_ratelimit_rejections_total",
 		Help: "Total requests rejected by a rate limiter, by limiter.",
 	}, []string{"limiter"}) // limiter: per_key|per_ip|global_concurrency
+
+	RateLimitFailOpenTotal = promauto.With(Registry).NewCounterVec(prometheus.CounterOpts{
+		Name: "trident_ratelimit_fail_open_total",
+		Help: "Total requests allowed because a rate-limit backend check failed, by limiter.",
+	}, []string{"limiter"}) // limiter: per_key
 
 	// DB pool saturation metrics (issue #238), sourced from pgxpool.Pool.Stat()
 	// by PollDBPool. All exposed as Gauges — Stat() itself only returns

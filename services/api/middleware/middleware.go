@@ -32,6 +32,8 @@ type LoggingResponseWriter struct {
 	statusCode int
 }
 
+func (w *LoggingResponseWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
 func (w *LoggingResponseWriter) WriteHeader(code int) {
 	w.statusCode = code
 	w.ResponseWriter.WriteHeader(code)

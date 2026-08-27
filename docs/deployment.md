@@ -736,14 +736,16 @@ without access to a real Kubernetes cluster or cloud credentials — the
 following require you to provision them once:
 
 - **Secrets**: `STAGING_KUBECONFIG` (repo/org secret, base64-encoded
-  kubeconfig scoped to the staging namespace) and `STAGING_API_KEY` must be
+  kubeconfig scoped to the staging namespace), `STAGING_API_KEY`,
+  `STAGING_DATABASE_URL` (when runner migrations are used), and
+  `STAGING_ALERT_WEBHOOK_URL` (optional) are stored as encrypted secrets. The
+  kubeconfig and API key must be
   set for `deploy-staging`/`smoke-test-staging` to run at all. Without them,
   those jobs are skipped (not failed) — see `check-staging-config` in the
   workflow.
-- **Variables**: `STAGING_NAMESPACE` (defaults to `trident-staging`),
+- **Variables**: `STAGING_NAMESPACE` (defaults to `trident-staging`) and
   `STAGING_URL` (public URL of the deployed staging stack, used by the smoke
-  test), `STAGING_DATABASE_URL` (for the migration step, if runner-reachable),
-  and `STAGING_ALERT_WEBHOOK_URL` (optional).
+  test). Variables must never contain credentials.
 - **Migrations are stubbed pending issue #308** ("database migration job as
   a Helm hook", still open): the workflow currently runs
   `sqlx migrate run` directly from the GitHub Actions runner against

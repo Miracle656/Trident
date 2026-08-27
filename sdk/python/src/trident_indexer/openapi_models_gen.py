@@ -1,7 +1,7 @@
-from dataclasses import dataclass
-from typing import Any, TypeVar, Callable, Type, cast
 from enum import Enum
+from dataclasses import dataclass
 from uuid import UUID
+from typing import Any, TypeVar, Type, Callable, cast
 
 
 T = TypeVar("T")
@@ -10,26 +10,6 @@ EnumT = TypeVar("EnumT", bound=Enum)
 
 def from_str(x: Any) -> str:
     assert isinstance(x, str)
-    return x
-
-
-def from_list(f: Callable[[Any], T], x: Any) -> list[T]:
-    assert isinstance(x, list)
-    return [f(y) for y in x]
-
-
-def to_class(c: Type[T], x: Any) -> dict:
-    assert isinstance(x, c)
-    return cast(Any, x).to_dict()
-
-
-def to_enum(c: Type[EnumT], x: Any) -> EnumT:
-    assert isinstance(x, c)
-    return x.value
-
-
-def from_bool(x: Any) -> bool:
-    assert isinstance(x, bool)
     return x
 
 
@@ -52,6 +32,26 @@ def from_union(fs, x):
     assert False
 
 
+def to_enum(c: Type[EnumT], x: Any) -> EnumT:
+    assert isinstance(x, c)
+    return x.value
+
+
+def from_list(f: Callable[[Any], T], x: Any) -> list[T]:
+    assert isinstance(x, list)
+    return [f(y) for y in x]
+
+
+def to_class(c: Type[T], x: Any) -> dict:
+    assert isinstance(x, c)
+    return cast(Any, x).to_dict()
+
+
+def from_bool(x: Any) -> bool:
+    assert isinstance(x, bool)
+    return x
+
+
 def from_float(x: Any) -> float:
     assert isinstance(x, (float, int)) and not isinstance(x, bool)
     return float(x)
@@ -60,6 +60,64 @@ def from_float(x: Any) -> float:
 def to_float(x: Any) -> float:
     assert isinstance(x, (int, float))
     return x
+
+
+class Network(Enum):
+    """Network queried"""
+
+    MAINNET = "mainnet"
+    TESTNET = "testnet"
+
+
+@dataclass
+class APIKeyResponse:
+    created_at: str
+    id: UUID
+    key_prefix: str
+    label: str
+    last_used_at: str
+    network: Network
+    rate_limit_tier: str
+    request_count: int
+    created_by: str | None = None
+    key: str | None = None
+    """Raw key, returned only at creation time."""
+
+    revoked_at: str | None = None
+
+    @staticmethod
+    def from_dict(obj: Any) -> 'APIKeyResponse':
+        assert isinstance(obj, dict)
+        created_at = from_str(obj.get("created_at"))
+        id = UUID(obj.get("id"))
+        key_prefix = from_str(obj.get("key_prefix"))
+        label = from_str(obj.get("label"))
+        last_used_at = from_str(obj.get("last_used_at"))
+        network = Network(obj.get("network"))
+        rate_limit_tier = from_str(obj.get("rate_limit_tier"))
+        request_count = from_int(obj.get("request_count"))
+        created_by = from_union([from_str, from_none], obj.get("created_by"))
+        key = from_union([from_str, from_none], obj.get("key"))
+        revoked_at = from_union([from_str, from_none], obj.get("revoked_at"))
+        return APIKeyResponse(created_at, id, key_prefix, label, last_used_at, network, rate_limit_tier, request_count, created_by, key, revoked_at)
+
+    def to_dict(self) -> dict:
+        result: dict = {}
+        result["created_at"] = from_str(self.created_at)
+        result["id"] = str(self.id)
+        result["key_prefix"] = from_str(self.key_prefix)
+        result["label"] = from_str(self.label)
+        result["last_used_at"] = from_str(self.last_used_at)
+        result["network"] = to_enum(Network, self.network)
+        result["rate_limit_tier"] = from_str(self.rate_limit_tier)
+        result["request_count"] = from_int(self.request_count)
+        if self.created_by is not None:
+            result["created_by"] = from_union([from_str, from_none], self.created_by)
+        if self.key is not None:
+            result["key"] = from_union([from_str, from_none], self.key)
+        if self.revoked_at is not None:
+            result["revoked_at"] = from_union([from_str, from_none], self.revoked_at)
+        return result
 
 
 @dataclass
@@ -104,13 +162,6 @@ class ContractEventSchema:
         result["event_name"] = from_str(self.event_name)
         result["fields"] = from_list(lambda x: to_class(ContractEventFieldSchema, x), self.fields)
         return result
-
-
-class Network(Enum):
-    """Network queried"""
-
-    MAINNET = "mainnet"
-    TESTNET = "testnet"
 
 
 @dataclass
@@ -211,33 +262,52 @@ class ContractSpecResponse:
 
 @dataclass
 class ContractStats:
+    avg_cpu_instructions: float
+    avg_fee_charged: float
+    avg_read_bytes: float
+    avg_write_bytes: float
     contract_id: str
     """Soroban contract address"""
 
     event_count: int
     """Total events for this contract in range"""
 
+    invocation_count: int
     last_seen_at: str
     """Timestamp of last event for this contract"""
 
     last_seen_ledger: int
     """Latest ledger sequence for this contract"""
 
+    total_fee_charged: int
+
     @staticmethod
     def from_dict(obj: Any) -> 'ContractStats':
         assert isinstance(obj, dict)
+        avg_cpu_instructions = from_float(obj.get("avg_cpu_instructions"))
+        avg_fee_charged = from_float(obj.get("avg_fee_charged"))
+        avg_read_bytes = from_float(obj.get("avg_read_bytes"))
+        avg_write_bytes = from_float(obj.get("avg_write_bytes"))
         contract_id = from_str(obj.get("contract_id"))
         event_count = from_int(obj.get("event_count"))
+        invocation_count = from_int(obj.get("invocation_count"))
         last_seen_at = from_str(obj.get("last_seen_at"))
         last_seen_ledger = from_int(obj.get("last_seen_ledger"))
-        return ContractStats(contract_id, event_count, last_seen_at, last_seen_ledger)
+        total_fee_charged = from_int(obj.get("total_fee_charged"))
+        return ContractStats(avg_cpu_instructions, avg_fee_charged, avg_read_bytes, avg_write_bytes, contract_id, event_count, invocation_count, last_seen_at, last_seen_ledger, total_fee_charged)
 
     def to_dict(self) -> dict:
         result: dict = {}
+        result["avg_cpu_instructions"] = to_float(self.avg_cpu_instructions)
+        result["avg_fee_charged"] = to_float(self.avg_fee_charged)
+        result["avg_read_bytes"] = to_float(self.avg_read_bytes)
+        result["avg_write_bytes"] = to_float(self.avg_write_bytes)
         result["contract_id"] = from_str(self.contract_id)
         result["event_count"] = from_int(self.event_count)
+        result["invocation_count"] = from_int(self.invocation_count)
         result["last_seen_at"] = from_str(self.last_seen_at)
         result["last_seen_ledger"] = from_int(self.last_seen_ledger)
+        result["total_fee_charged"] = from_int(self.total_fee_charged)
         return result
 
 
@@ -311,8 +381,7 @@ class ContractStorageValue:
         result["observed_at"] = from_str(self.observed_at)
         result["storage_key"] = from_str(self.storage_key)
         result["key"] = self.key
-        if self.value is not None:
-            result["value"] = self.value
+        result["value"] = self.value
         return result
 
 
@@ -465,7 +534,7 @@ class EventListResponse:
     has_more: bool
     """Whether more results are available"""
 
-    next_cursor: str | None = None
+    next_cursor: str
     """Opaque cursor for next page (null if has_more is false)"""
 
     @staticmethod
@@ -473,15 +542,14 @@ class EventListResponse:
         assert isinstance(obj, dict)
         events = from_list(SorobanEvent.from_dict, obj.get("events"))
         has_more = from_bool(obj.get("has_more"))
-        next_cursor = from_union([from_str, from_none], obj.get("next_cursor"))
+        next_cursor = from_str(obj.get("next_cursor"))
         return EventListResponse(events, has_more, next_cursor)
 
     def to_dict(self) -> dict:
         result: dict = {}
         result["events"] = from_list(lambda x: to_class(SorobanEvent, x), self.events)
         result["has_more"] = from_bool(self.has_more)
-        if self.next_cursor is not None:
-            result["next_cursor"] = from_union([from_str, from_none], self.next_cursor)
+        result["next_cursor"] = from_str(self.next_cursor)
         return result
 
 
@@ -495,74 +563,66 @@ class IndexerStatsResponseStatus(Enum):
 
 @dataclass
 class IndexerStatsResponse:
+    avg_poll_duration_ms: int
+    """Average poll duration in milliseconds"""
+
+    chain_tip_ledger: int
+    """Current chain tip ledger (from RPC)"""
+
+    events_indexed_total: int
+    """Cumulative events indexed"""
+
+    events_last_poll: int
+    """Events processed in last poll"""
+
+    lag_ledgers: int
+    """Number of ledgers behind chain tip"""
+
+    lag_seconds_estimated: float
+    """Estimated wall-clock staleness in seconds: lag_ledgers times Stellar's protocol-target
+    ledger close time (~5s). Null whenever lag_ledgers is null. See
+    docs/observability/data-freshness.md for the full freshness contract this field is part
+    of.
+    """
+    last_ledger_indexed: int
+    """Latest indexed ledger sequence"""
+
+    last_poll_at: str
+    """Timestamp of last successful poll"""
+
     network: str
     """Network name from NETWORK environment variable"""
 
     status: IndexerStatsResponseStatus
     """Indexer health status"""
 
-    avg_poll_duration_ms: int | None = None
-    """Average poll duration in milliseconds"""
-
-    chain_tip_ledger: int | None = None
-    """Current chain tip ledger (from RPC)"""
-
-    events_indexed_total: int | None = None
-    """Cumulative events indexed"""
-
-    events_last_poll: int | None = None
-    """Events processed in last poll"""
-
-    lag_ledgers: int | None = None
-    """Number of ledgers behind chain tip"""
-
-    lag_seconds_estimated: float | None = None
-    """Estimated wall-clock staleness in seconds: lag_ledgers times Stellar's protocol-target
-    ledger close time (~5s). Null whenever lag_ledgers is null. See
-    docs/observability/data-freshness.md for the full freshness contract this field is part
-    of.
-    """
-    last_ledger_indexed: int | None = None
-    """Latest indexed ledger sequence"""
-
-    last_poll_at: str | None = None
-    """Timestamp of last successful poll"""
-
     @staticmethod
     def from_dict(obj: Any) -> 'IndexerStatsResponse':
         assert isinstance(obj, dict)
+        avg_poll_duration_ms = from_int(obj.get("avg_poll_duration_ms"))
+        chain_tip_ledger = from_int(obj.get("chain_tip_ledger"))
+        events_indexed_total = from_int(obj.get("events_indexed_total"))
+        events_last_poll = from_int(obj.get("events_last_poll"))
+        lag_ledgers = from_int(obj.get("lag_ledgers"))
+        lag_seconds_estimated = from_float(obj.get("lag_seconds_estimated"))
+        last_ledger_indexed = from_int(obj.get("last_ledger_indexed"))
+        last_poll_at = from_str(obj.get("last_poll_at"))
         network = from_str(obj.get("network"))
         status = IndexerStatsResponseStatus(obj.get("status"))
-        avg_poll_duration_ms = from_union([from_int, from_none], obj.get("avg_poll_duration_ms"))
-        chain_tip_ledger = from_union([from_int, from_none], obj.get("chain_tip_ledger"))
-        events_indexed_total = from_union([from_int, from_none], obj.get("events_indexed_total"))
-        events_last_poll = from_union([from_int, from_none], obj.get("events_last_poll"))
-        lag_ledgers = from_union([from_int, from_none], obj.get("lag_ledgers"))
-        lag_seconds_estimated = from_union([from_float, from_none], obj.get("lag_seconds_estimated"))
-        last_ledger_indexed = from_union([from_int, from_none], obj.get("last_ledger_indexed"))
-        last_poll_at = from_union([from_str, from_none], obj.get("last_poll_at"))
-        return IndexerStatsResponse(network, status, avg_poll_duration_ms, chain_tip_ledger, events_indexed_total, events_last_poll, lag_ledgers, lag_seconds_estimated, last_ledger_indexed, last_poll_at)
+        return IndexerStatsResponse(avg_poll_duration_ms, chain_tip_ledger, events_indexed_total, events_last_poll, lag_ledgers, lag_seconds_estimated, last_ledger_indexed, last_poll_at, network, status)
 
     def to_dict(self) -> dict:
         result: dict = {}
+        result["avg_poll_duration_ms"] = from_int(self.avg_poll_duration_ms)
+        result["chain_tip_ledger"] = from_int(self.chain_tip_ledger)
+        result["events_indexed_total"] = from_int(self.events_indexed_total)
+        result["events_last_poll"] = from_int(self.events_last_poll)
+        result["lag_ledgers"] = from_int(self.lag_ledgers)
+        result["lag_seconds_estimated"] = to_float(self.lag_seconds_estimated)
+        result["last_ledger_indexed"] = from_int(self.last_ledger_indexed)
+        result["last_poll_at"] = from_str(self.last_poll_at)
         result["network"] = from_str(self.network)
         result["status"] = to_enum(IndexerStatsResponseStatus, self.status)
-        if self.avg_poll_duration_ms is not None:
-            result["avg_poll_duration_ms"] = from_union([from_int, from_none], self.avg_poll_duration_ms)
-        if self.chain_tip_ledger is not None:
-            result["chain_tip_ledger"] = from_union([from_int, from_none], self.chain_tip_ledger)
-        if self.events_indexed_total is not None:
-            result["events_indexed_total"] = from_union([from_int, from_none], self.events_indexed_total)
-        if self.events_last_poll is not None:
-            result["events_last_poll"] = from_union([from_int, from_none], self.events_last_poll)
-        if self.lag_ledgers is not None:
-            result["lag_ledgers"] = from_union([from_int, from_none], self.lag_ledgers)
-        if self.lag_seconds_estimated is not None:
-            result["lag_seconds_estimated"] = from_union([to_float, from_none], self.lag_seconds_estimated)
-        if self.last_ledger_indexed is not None:
-            result["last_ledger_indexed"] = from_union([from_int, from_none], self.last_ledger_indexed)
-        if self.last_poll_at is not None:
-            result["last_poll_at"] = from_union([from_str, from_none], self.last_poll_at)
         return result
 
 
@@ -702,7 +762,46 @@ class TokenMetadataResponse:
 
 
 @dataclass
+class VersionResponse:
+    build_timestamp: str
+    """RFC 3339 build time, or "unknown" when not injected at build time. Not typed as date-time
+    because of that sentinel.
+    """
+    commit_sha: str
+    """Full git commit SHA the binary was built from, or "unknown" when not injected at build
+    time.
+    """
+    schema_version: str
+    """Highest applied migration version from _sqlx_migrations, as a string. Null when no
+    migrations have been applied yet or when Postgres is unreachable — the endpoint still
+    returns 200 in that case so build metadata stays available during an outage.
+    """
+    version: str
+    """Semantic version tag of the running build, or "dev" for a binary built without release
+    ldflags.
+    """
+
+    @staticmethod
+    def from_dict(obj: Any) -> 'VersionResponse':
+        assert isinstance(obj, dict)
+        build_timestamp = from_str(obj.get("build_timestamp"))
+        commit_sha = from_str(obj.get("commit_sha"))
+        schema_version = from_str(obj.get("schema_version"))
+        version = from_str(obj.get("version"))
+        return VersionResponse(build_timestamp, commit_sha, schema_version, version)
+
+    def to_dict(self) -> dict:
+        result: dict = {}
+        result["build_timestamp"] = from_str(self.build_timestamp)
+        result["commit_sha"] = from_str(self.commit_sha)
+        result["schema_version"] = from_str(self.schema_version)
+        result["version"] = from_str(self.version)
+        return result
+
+
+@dataclass
 class OpenAPIModels:
+    api_key_response: APIKeyResponse | None = None
     contract_event_field_schema: ContractEventFieldSchema | None = None
     contract_event_schema: ContractEventSchema | None = None
     contract_event_schema_response: ContractEventSchemaResponse | None = None
@@ -720,10 +819,12 @@ class OpenAPIModels:
     ready_response: ReadyResponse | None = None
     soroban_event: SorobanEvent | None = None
     token_metadata_response: TokenMetadataResponse | None = None
+    version_response: VersionResponse | None = None
 
     @staticmethod
     def from_dict(obj: Any) -> 'OpenAPIModels':
         assert isinstance(obj, dict)
+        api_key_response = from_union([APIKeyResponse.from_dict, from_none], obj.get("APIKeyResponse"))
         contract_event_field_schema = from_union([ContractEventFieldSchema.from_dict, from_none], obj.get("ContractEventFieldSchema"))
         contract_event_schema = from_union([ContractEventSchema.from_dict, from_none], obj.get("ContractEventSchema"))
         contract_event_schema_response = from_union([ContractEventSchemaResponse.from_dict, from_none], obj.get("ContractEventSchemaResponse"))
@@ -741,10 +842,13 @@ class OpenAPIModels:
         ready_response = from_union([ReadyResponse.from_dict, from_none], obj.get("ReadyResponse"))
         soroban_event = from_union([SorobanEvent.from_dict, from_none], obj.get("SorobanEvent"))
         token_metadata_response = from_union([TokenMetadataResponse.from_dict, from_none], obj.get("TokenMetadataResponse"))
-        return OpenAPIModels(contract_event_field_schema, contract_event_schema, contract_event_schema_response, contract_spec_function, contract_spec_response, contract_stats, contract_stats_response, contract_storage_response, contract_storage_value, error_response, event_list_response, indexer_stats_response, liveness_response, ready_checks, ready_response, soroban_event, token_metadata_response)
+        version_response = from_union([VersionResponse.from_dict, from_none], obj.get("VersionResponse"))
+        return OpenAPIModels(api_key_response, contract_event_field_schema, contract_event_schema, contract_event_schema_response, contract_spec_function, contract_spec_response, contract_stats, contract_stats_response, contract_storage_response, contract_storage_value, error_response, event_list_response, indexer_stats_response, liveness_response, ready_checks, ready_response, soroban_event, token_metadata_response, version_response)
 
     def to_dict(self) -> dict:
         result: dict = {}
+        if self.api_key_response is not None:
+            result["APIKeyResponse"] = from_union([lambda x: to_class(APIKeyResponse, x), from_none], self.api_key_response)
         if self.contract_event_field_schema is not None:
             result["ContractEventFieldSchema"] = from_union([lambda x: to_class(ContractEventFieldSchema, x), from_none], self.contract_event_field_schema)
         if self.contract_event_schema is not None:
@@ -779,6 +883,8 @@ class OpenAPIModels:
             result["SorobanEvent"] = from_union([lambda x: to_class(SorobanEvent, x), from_none], self.soroban_event)
         if self.token_metadata_response is not None:
             result["TokenMetadataResponse"] = from_union([lambda x: to_class(TokenMetadataResponse, x), from_none], self.token_metadata_response)
+        if self.version_response is not None:
+            result["VersionResponse"] = from_union([lambda x: to_class(VersionResponse, x), from_none], self.version_response)
         return result
 
 

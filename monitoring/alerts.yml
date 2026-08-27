@@ -52,7 +52,7 @@ groups:
   - name: trident.indexer.heartbeat
     rules:
       - alert: TridentIndexerHeartbeatStale
-        expr: (time() - trident_indexer_heartbeat_timestamp_seconds) > 300
+        expr: (time() - trident_indexer_last_poll_timestamp_seconds) > 300
         for: 2m
         labels:
           severity: critical
@@ -60,15 +60,23 @@ groups:
         annotations:
           summary: "Trident indexer heartbeat is stale"
           description: >
-            trident_indexer_heartbeat_timestamp_seconds on
+            trident_indexer_last_poll_timestamp_seconds on
             {{ $labels.instance }} has not advanced in over 5 minutes. The
             poll loop is hung (deadlock, panic caught by a supervisor,
             blocked I/O) even though the process may still be running and
             /metrics may still respond.
           runbook_url: "docs/runbooks/alerts.md#tridentindexerheartbeatstale"
 
+      # #466 added a TridentIndexerStalled alert here for issue #400. It is
+      # dropped: with the metric name corrected above, TridentIndexerHeartbeatStale
+      # already covers staleness and TridentIndexerMetricsMissing already
+      # covers absence, both at the same critical severity. A third rule on
+      # the same series only pages twice for one failure. What #400 actually
+      # asked for — firing on silence rather than on lag — is satisfied by
+      # these two now that they query a series the indexer emits.
+
       - alert: TridentIndexerMetricsMissing
-        expr: absent(trident_indexer_heartbeat_timestamp_seconds)
+        expr: absent(trident_indexer_last_poll_timestamp_seconds)
         for: 3m
         labels:
           severity: critical
@@ -76,7 +84,7 @@ groups:
         annotations:
           summary: "Trident indexer metrics are missing entirely"
           description: >
-            No trident_indexer_heartbeat_timestamp_seconds series exists —
+            No trident_indexer_last_poll_timestamp_seconds series exists —
             the indexer's /metrics endpoint is not scrapeable at all (process
             down, crashed, or a scrape-config/network problem).
           runbook_url: "docs/runbooks/alerts.md#tridentindexermetricsmissing"
@@ -128,7 +136,7 @@ groups:
           (
             sum(rate(trident_indexer_rpc_errors_total[5m]))
             /
-            (sum(rate(trident_indexer_rpc_request_duration_seconds_count[5m])) + 0.0001)
+            (sum(rate(trident_indexer_rpc_call_duration_seconds_count[5m])) + 0.0001)
           ) > 0.05
         for: 10m
         labels:
@@ -147,7 +155,7 @@ groups:
           (
             sum(rate(trident_indexer_rpc_errors_total[5m]))
             /
-            (sum(rate(trident_indexer_rpc_request_duration_seconds_count[5m])) + 0.0001)
+            (sum(rate(trident_indexer_rpc_call_duration_seconds_count[5m])) + 0.0001)
           ) > 0.25
         for: 5m
         labels:

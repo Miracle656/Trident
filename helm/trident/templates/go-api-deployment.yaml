@@ -61,6 +61,11 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.global.existingSecret }}
                   key: ADMIN_API_KEY
+            - name: API_KEY_SALT
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.global.existingSecret }}
+                  key: API_KEY_SALT
             {{- if .Values.internalMTLS.enabled }}
             # Behind a flag (issue #320): the Go API dials the gRPC server
             # with a client cert and verifies the server against

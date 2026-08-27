@@ -31,12 +31,12 @@ type AuditEntry struct {
 
 // AuditWriter asynchronously writes audit log entries to PostgreSQL.
 type AuditWriter struct {
-	ch       chan AuditEntry
-	pool     *pgxpool.Pool
-	logger   *slog.Logger
-	wg       sync.WaitGroup
-	closed   bool
-	closeMu  sync.Mutex
+	ch      chan AuditEntry
+	pool    *pgxpool.Pool
+	logger  *slog.Logger
+	wg      sync.WaitGroup
+	closed  bool
+	closeMu sync.Mutex
 }
 
 // NewAuditWriter creates a new AuditWriter with a buffered channel.
@@ -302,3 +302,5 @@ func SetAuditResultCount(w http.ResponseWriter, count int) {
 		wrapped.resultCount = &count
 	}
 }
+
+func (w *auditResponseWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }

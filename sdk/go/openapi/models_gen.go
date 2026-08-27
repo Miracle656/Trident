@@ -21,6 +21,7 @@ func (r *OpenAPIModels) Marshal() ([]byte, error) {
 }
 
 type OpenAPIModels struct {
+	APIKeyResponse              *APIKeyResponse              `json:"APIKeyResponse,omitempty"`
 	ContractEventFieldSchema    *ContractEventFieldSchema    `json:"ContractEventFieldSchema,omitempty"`
 	ContractEventSchema         *ContractEventSchema         `json:"ContractEventSchema,omitempty"`
 	ContractEventSchemaResponse *ContractEventSchemaResponse `json:"ContractEventSchemaResponse,omitempty"`
@@ -38,6 +39,22 @@ type OpenAPIModels struct {
 	ReadyResponse               *ReadyResponse               `json:"ReadyResponse,omitempty"`
 	SorobanEvent                *SorobanEvent                `json:"SorobanEvent,omitempty"`
 	TokenMetadataResponse       *TokenMetadataResponse       `json:"TokenMetadataResponse,omitempty"`
+	VersionResponse             *VersionResponse             `json:"VersionResponse,omitempty"`
+}
+
+type APIKeyResponse struct {
+	CreatedAt                                  time.Time  `json:"created_at"`
+	CreatedBy                                  *string    `json:"created_by,omitempty"`
+	ID                                         string     `json:"id"`
+	// Raw key, returned only at creation time.           
+	Key                                        *string    `json:"key,omitempty"`
+	KeyPrefix                                  string     `json:"key_prefix"`
+	Label                                      string     `json:"label"`
+	LastUsedAt                                 time.Time  `json:"last_used_at"`
+	Network                                    Network    `json:"network"`
+	RateLimitTier                              string     `json:"rate_limit_tier"`
+	RequestCount                               int64      `json:"request_count"`
+	RevokedAt                                  *time.Time `json:"revoked_at,omitempty"`
 }
 
 type ContractEventFieldSchema struct {
@@ -88,14 +105,20 @@ type ContractSpecResponse struct {
 }
 
 type ContractStats struct {
+	AvgCPUInstructions                          float64   `json:"avg_cpu_instructions"`
+	AvgFeeCharged                               float64   `json:"avg_fee_charged"`
+	AvgReadBytes                                float64   `json:"avg_read_bytes"`
+	AvgWriteBytes                               float64   `json:"avg_write_bytes"`
 	// Soroban contract address                           
 	ContractID                                  string    `json:"contract_id"`
 	// Total events for this contract in range            
 	EventCount                                  int64     `json:"event_count"`
+	InvocationCount                             int64     `json:"invocation_count"`
 	// Timestamp of last event for this contract          
 	LastSeenAt                                  time.Time `json:"last_seen_at"`
 	// Latest ledger sequence for this contract           
 	LastSeenLedger                              int64     `json:"last_seen_ledger"`
+	TotalFeeCharged                             int64     `json:"total_fee_charged"`
 }
 
 type ContractStatsResponse struct {
@@ -152,7 +175,7 @@ type EventListResponse struct {
 	// Whether more results are available                                    
 	HasMore                                                   bool           `json:"has_more"`
 	// Opaque cursor for next page (null if has_more is false)               
-	NextCursor                                                *string        `json:"next_cursor,omitempty"`
+	NextCursor                                                string         `json:"next_cursor"`
 }
 
 type SorobanEvent struct {
@@ -180,24 +203,24 @@ type SorobanEvent struct {
 
 type IndexerStatsResponse struct {
 	// Average poll duration in milliseconds                                                                             
-	AvgPollDurationMS                                                                         *int64                     `json:"avg_poll_duration_ms,omitempty"`
+	AvgPollDurationMS                                                                         int64                      `json:"avg_poll_duration_ms"`
 	// Current chain tip ledger (from RPC)                                                                               
-	ChainTipLedger                                                                            *int64                     `json:"chain_tip_ledger,omitempty"`
+	ChainTipLedger                                                                            int64                      `json:"chain_tip_ledger"`
 	// Cumulative events indexed                                                                                         
-	EventsIndexedTotal                                                                        *int64                     `json:"events_indexed_total,omitempty"`
+	EventsIndexedTotal                                                                        int64                      `json:"events_indexed_total"`
 	// Events processed in last poll                                                                                     
-	EventsLastPoll                                                                            *int64                     `json:"events_last_poll,omitempty"`
+	EventsLastPoll                                                                            int64                      `json:"events_last_poll"`
 	// Number of ledgers behind chain tip                                                                                
-	LagLedgers                                                                                *int64                     `json:"lag_ledgers,omitempty"`
+	LagLedgers                                                                                int64                      `json:"lag_ledgers"`
 	// Estimated wall-clock staleness in seconds: lag_ledgers times Stellar's protocol-target                            
 	// ledger close time (~5s). Null whenever lag_ledgers is null. See                                                   
 	// docs/observability/data-freshness.md for the full freshness contract this field is part                           
 	// of.                                                                                                               
-	LagSecondsEstimated                                                                       *float64                   `json:"lag_seconds_estimated,omitempty"`
+	LagSecondsEstimated                                                                       float64                    `json:"lag_seconds_estimated"`
 	// Latest indexed ledger sequence                                                                                    
-	LastLedgerIndexed                                                                         *int64                     `json:"last_ledger_indexed,omitempty"`
+	LastLedgerIndexed                                                                         int64                      `json:"last_ledger_indexed"`
 	// Timestamp of last successful poll                                                                                 
-	LastPollAt                                                                                *time.Time                 `json:"last_poll_at,omitempty"`
+	LastPollAt                                                                                time.Time                  `json:"last_poll_at"`
 	// Network name from NETWORK environment variable                                                                    
 	Network                                                                                   string                     `json:"network"`
 	// Indexer health status                                                                                             
@@ -243,6 +266,22 @@ type TokenMetadataResponse struct {
 	ResolvedAt                                                                                *time.Time `json:"resolved_at,omitempty"`
 	// Token symbol, from symbol(). Null unless is_token is true.                                        
 	Symbol                                                                                    *string    `json:"symbol,omitempty"`
+}
+
+type VersionResponse struct {
+	// RFC 3339 build time, or "unknown" when not injected at build time. Not typed as date-time       
+	// because of that sentinel.                                                                       
+	BuildTimestamp                                                                              string `json:"build_timestamp"`
+	// Full git commit SHA the binary was built from, or "unknown" when not injected at build          
+	// time.                                                                                           
+	CommitSHA                                                                                   string `json:"commit_sha"`
+	// Highest applied migration version from _sqlx_migrations, as a string. Null when no              
+	// migrations have been applied yet or when Postgres is unreachable — the endpoint still           
+	// returns 200 in that case so build metadata stays available during an outage.                    
+	SchemaVersion                                                                               string `json:"schema_version"`
+	// Semantic version tag of the running build, or "dev" for a binary built without release          
+	// ldflags.                                                                                        
+	Version                                                                                     string `json:"version"`
 }
 
 // Network queried

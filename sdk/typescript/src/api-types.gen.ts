@@ -44,6 +44,28 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/version": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Build and schema version
+         * @description Reports which build is running — semantic version tag, git commit SHA, build timestamp, and the highest applied database migration (issue #397). Answers "which build is live?" during an incident without reading GHCR tags or pod specs.
+         *     Authenticated: the commit SHA and schema version narrow the search for known-vulnerable code paths, so this is not public. Use /v1/ready for an unauthenticated liveness signal.
+         *     When the database is unreachable the endpoint still returns 200 with build metadata and a null schema_version, so it stays usable during exactly the outage you need it for.
+         */
+        get: operations["getVersion"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/events": {
         parameters: {
             query?: never;
@@ -387,7 +409,7 @@ export interface components {
             /** @description Whether more results are available */
             has_more: boolean;
             /** @description Opaque cursor for next page (null if has_more is false) */
-            next_cursor?: string | null;
+            next_cursor: string | null;
         };
         LivenessResponse: {
             /**
@@ -417,6 +439,25 @@ export interface components {
             indexer_lag: number | null;
             checks: components["schemas"]["ReadyChecks"];
         };
+        VersionResponse: {
+            /**
+             * @description Semantic version tag of the running build, or "dev" for a binary built without release ldflags.
+             * @example v1.2.3
+             */
+            version: string;
+            /**
+             * @description Full git commit SHA the binary was built from, or "unknown" when not injected at build time.
+             * @example 2e6ad17c8f9b4a1d3e5f7a9c2b4d6e8f0a1c3e5d
+             */
+            commit_sha: string;
+            /**
+             * @description RFC 3339 build time, or "unknown" when not injected at build time. Not typed as date-time because of that sentinel.
+             * @example 2026-08-26T15:19:00Z
+             */
+            build_timestamp: string;
+            /** @description Highest applied migration version from _sqlx_migrations, as a string. Null when no migrations have been applied yet or when Postgres is unreachable — the endpoint still returns 200 in that case so build metadata stays available during an outage. */
+            schema_version: string | null;
+        };
         IndexerStatsResponse: {
             /**
              * @description Indexer health status
@@ -429,42 +470,42 @@ export interface components {
              * Format: int64
              * @description Latest indexed ledger sequence
              */
-            last_ledger_indexed?: number | null;
+            last_ledger_indexed: number | null;
             /**
              * Format: int64
              * @description Current chain tip ledger (from RPC)
              */
-            chain_tip_ledger?: number | null;
+            chain_tip_ledger: number | null;
             /**
              * Format: int64
              * @description Number of ledgers behind chain tip
              */
-            lag_ledgers?: number | null;
+            lag_ledgers: number | null;
             /**
              * Format: double
              * @description Estimated wall-clock staleness in seconds: lag_ledgers times Stellar's protocol-target ledger close time (~5s). Null whenever lag_ledgers is null. See docs/observability/data-freshness.md for the full freshness contract this field is part of.
              */
-            lag_seconds_estimated?: number | null;
+            lag_seconds_estimated: number | null;
             /**
              * Format: int64
              * @description Cumulative events indexed
              */
-            events_indexed_total?: number | null;
+            events_indexed_total: number | null;
             /**
              * Format: int32
              * @description Events processed in last poll
              */
-            events_last_poll?: number | null;
+            events_last_poll: number | null;
             /**
              * Format: int32
              * @description Average poll duration in milliseconds
              */
-            avg_poll_duration_ms?: number | null;
+            avg_poll_duration_ms: number | null;
             /**
              * Format: date-time
              * @description Timestamp of last successful poll
              */
-            last_poll_at?: string | null;
+            last_poll_at: string | null;
         };
         TokenMetadataResponse: {
             /** @description Soroban contract address */
@@ -556,7 +597,7 @@ export interface components {
             /** @description Human-readable decoded storage key */
             key: unknown;
             /** @description Human-readable decoded value (absent when the entry was removed) */
-            value?: unknown;
+            value: unknown;
             /**
              * Format: int64
              * @description Ledger sequence at which this value was observed
@@ -610,6 +651,38 @@ export interface components {
              * @description Timestamp of last event for this contract
              */
             last_seen_at: string;
+            /** Format: int64 */
+            invocation_count: number | null;
+            /** Format: int64 */
+            total_fee_charged: number | null;
+            /** Format: double */
+            avg_fee_charged: number | null;
+            /** Format: double */
+            avg_cpu_instructions: number | null;
+            /** Format: double */
+            avg_read_bytes: number | null;
+            /** Format: double */
+            avg_write_bytes: number | null;
+        };
+        APIKeyResponse: {
+            /** Format: uuid */
+            id: string;
+            key_prefix: string;
+            /** @description Raw key, returned only at creation time. */
+            key?: string;
+            label: string;
+            /** @enum {string} */
+            network: "testnet" | "mainnet";
+            rate_limit_tier: string;
+            created_by?: string;
+            /** Format: date-time */
+            last_used_at: string | null;
+            /** Format: int64 */
+            request_count: number;
+            /** Format: date-time */
+            revoked_at?: string | null;
+            /** Format: date-time */
+            created_at: string;
         };
         ErrorResponse: {
             error: {
@@ -770,24 +843,44 @@ export interface operations {
             };
         };
     };
+    getVersion: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Build metadata for the running instance */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["VersionResponse"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            429: components["responses"]["RateLimitExceeded"];
+        };
+    };
     listEvents: {
         parameters: {
             query?: {
                 /**
                  * @description Filter by Soroban contract address (strkey format, 56 chars starting with C)
-                 * @example CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM
+                 * @example CA7QYNF7SOWQ3GLR2BGMZEHXAVIRZA4KVWLTJJFC7MGXUA74P7UJVSGZ
                  */
-                contract_id?: string;
+                contractId?: string;
                 /** @description Filter by primary topic (XDR-encoded) */
-                topic_0?: string;
+                topic0?: string;
                 /** @description Filter by secondary topic (XDR-encoded) */
-                topic_1?: string;
+                topic1?: string;
                 /** @description Lower bound of ledger range (inclusive) */
-                from_ledger?: number;
+                ledgerFrom?: number;
                 /** @description Upper bound of ledger range (inclusive) */
-                to_ledger?: number;
-                /** @description Network to query */
-                network?: "testnet" | "mainnet";
+                ledgerTo?: number;
                 /** @description Maximum number of events to return */
                 limit?: number;
                 /** @description Opaque pagination cursor from previous response's next_cursor (for next page) */
@@ -865,9 +958,9 @@ export interface operations {
         parameters: {
             query: {
                 /** @description Contract to subscribe to */
-                contract_id: string;
+                contractId: string;
                 /** @description Optional topic filter */
-                topic_0?: string;
+                topic0?: string;
             };
             header?: never;
             path?: never;
@@ -884,7 +977,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "text/event-stream": Record<string, never>;
+                    "text/event-stream": string;
                 };
             };
             400: components["responses"]["BadRequest"];
@@ -1134,19 +1227,7 @@ export interface operations {
                 };
                 content: {
                     "application/json": {
-                        keys?: {
-                            /** Format: uuid */
-                            id?: string;
-                            key_prefix?: string;
-                            label?: string;
-                            network?: string;
-                            rate_limit_tier?: string;
-                            /** Format: date-time */
-                            last_used_at?: string;
-                            request_count?: number;
-                            /** Format: date-time */
-                            created_at?: string;
-                        }[];
+                        api_keys: components["schemas"]["APIKeyResponse"][];
                     };
                 };
             };
@@ -1188,14 +1269,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": {
-                        /** Format: uuid */
-                        id?: string;
-                        /** @description The raw API key (shown only once) */
-                        key?: string;
-                        /** @description First 16 characters of key for reference */
-                        key_prefix?: string;
-                    };
+                    "application/json": components["schemas"]["APIKeyResponse"];
                 };
             };
             400: components["responses"]["BadRequest"];
@@ -1250,11 +1324,36 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": Record<string, never>;
+                    "application/json": {
+                        pools: {
+                            [key: string]: unknown;
+                        }[];
+                        stats: {
+                            [key: string]: unknown;
+                        }[];
+                    };
                 };
             };
             401: components["responses"]["Unauthorized"];
             429: components["responses"]["TooManyRequestsIPOnly"];
+            /** @description The PgBouncer admin console could not be read. It is the upstream here, so a failure to reach it is a bad-gateway condition rather than an error in this service (see handlers/admin.go). */
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description The endpoint is not configured — ADMIN_API_KEY or PGBOUNCER_ADMIN_URL is unset, so no stats source exists. Deploying without PgBouncer is a supported configuration. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
         };
     };
     getMetrics: {
@@ -1272,7 +1371,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "text/plain; version=0.0.4": string;
+                    "text/plain; version=0.0.4; charset=utf-8": string;
                 };
             };
         };

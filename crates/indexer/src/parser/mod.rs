@@ -207,7 +207,69 @@ fn parse_event_type(raw: &str) -> Result<EventType, TridentError> {
     }
 }
 
-pub(crate) fn decode_scval(b64: &str) -> Result<ScVal, TridentError> {
+/// Render a 256-bit unsigned value, supplied as four 64-bit limbs
+/// (most-significant first), as a decimal string.
+///
+/// Rust has no u256, and the previous implementation packed all four limbs
+/// into a u128 with 32-bit shifts — which both truncated the top half and
+/// mis-positioned the rest, so any value above 2^128 decoded to a
+/// plausible-looking but wrong number. Long multiplication over decimal
+/// digits avoids needing a big-integer dependency for the one place we need
+/// this (issue #415).
+fn u256_limbs_to_decimal(limbs: [u64; 4]) -> String {
+    // digits holds the running value, least-significant decimal digit first.
+    let mut digits: Vec<u8> = vec![0];
+    for limb in limbs {
+        // value = value * 2^64 + limb, done as two steps over base-10 digits.
+        for _ in 0..64 {
+            let mut carry = 0u8;
+            for d in digits.iter_mut() {
+                let doubled = *d * 2 + carry;
+                *d = doubled % 10;
+                carry = doubled / 10;
+            }
+            if carry > 0 {
+                digits.push(carry);
+            }
+        }
+        let mut carry = limb as u128;
+        let mut i = 0;
+        while carry > 0 || i < digits.len() {
+            if i == digits.len() {
+                digits.push(0);
+            }
+            let sum = digits[i] as u128 + (carry % 10);
+            digits[i] = (sum % 10) as u8;
+            carry = carry / 10 + sum / 10;
+            i += 1;
+        }
+    }
+    while digits.len() > 1 && *digits.last().unwrap() == 0 {
+        digits.pop();
+    }
+    digits.iter().rev().map(|d| (b'0' + d) as char).collect()
+}
+
+/// Render a 256-bit signed value from its limbs. `hi_hi` is the signed
+/// most-significant limb; negatives are two's complement across all 256 bits,
+/// so they are negated into the unsigned domain and printed with a sign.
+fn i256_limbs_to_decimal(hi_hi: i64, hi_lo: u64, lo_hi: u64, lo_lo: u64) -> String {
+    if hi_hi >= 0 {
+        return u256_limbs_to_decimal([hi_hi as u64, hi_lo, lo_hi, lo_lo]);
+    }
+    // Two's complement negate: invert all limbs, then add one with carry.
+    let mut limbs = [!(hi_hi as u64), !hi_lo, !lo_hi, !lo_lo];
+    for limb in limbs.iter_mut().rev() {
+        let (next, overflow) = limb.overflowing_add(1);
+        *limb = next;
+        if !overflow {
+            break;
+        }
+    }
+    format!("-{}", u256_limbs_to_decimal(limbs))
+}
+
+pub fn decode_scval(b64: &str) -> Result<ScVal, TridentError> {
     let bytes = STANDARD
         .decode(b64)
         .map_err(|e| TridentError::parse(anyhow::Error::new(e).context("base64 decode")))?;
@@ -236,23 +298,28 @@ pub fn scval_to_string(val: &ScVal) -> String {
             val.to_string()
         }
         ScVal::U256(parts) => {
-            let val = ((parts.hi_hi as u128) << 96)
-                | ((parts.hi_lo as u128) << 64)
-                | ((parts.lo_hi as u128) << 32)
-                | (parts.lo_lo as u128);
-            val.to_string()
+            u256_limbs_to_decimal([parts.hi_hi, parts.hi_lo, parts.lo_hi, parts.lo_lo])
         }
         ScVal::I256(parts) => {
-            let val = ((parts.hi_hi as i128) << 96)
-                | ((parts.hi_lo as i128) << 64)
-                | ((parts.lo_hi as i128) << 32)
-                | (parts.lo_lo as i128);
-            val.to_string()
+            i256_limbs_to_decimal(parts.hi_hi, parts.hi_lo, parts.lo_hi, parts.lo_lo)
         }
         ScVal::Bytes(b) => hex::encode(b.as_slice()),
         ScVal::Address(addr) => scaddress_to_string(addr),
+        // Timepoint and Duration are u64 newtypes; without these arms they fell
+        // through to the debug catch-all and rendered as "Timepoint(1700000000)"
+        // rather than a usable value, while also tripping the
+        // unhandled-variant metric on well-understood types (issue #415).
+        ScVal::Timepoint(t) => t.0.to_string(),
+        ScVal::Duration(d) => d.0.to_string(),
+        // A contract error in topic/data position. Rendered via Debug
+        // deliberately: the variant carries a code whose meaning is
+        // contract-defined, so there is no stable scalar to project it to.
+        ScVal::Error(e) => format!("{e:?}"),
         // For complex types in topic position, fall back to debug representation
-        other => format!("{other:?}"),
+        other => {
+            crate::metrics::record_unhandled_scvariant();
+            format!("{other:?}")
+        }
     }
 }
 
@@ -284,22 +351,26 @@ pub fn scval_to_json(val: &ScVal) -> Json {
                 Json::String(v.to_string())
             }
         }
-        ScVal::U256(parts) => {
-            let val = ((parts.hi_hi as u128) << 96)
-                | ((parts.hi_lo as u128) << 64)
-                | ((parts.lo_hi as u128) << 32)
-                | (parts.lo_lo as u128);
-            Json::String(val.to_string())
-        }
-        ScVal::I256(parts) => {
-            let val = ((parts.hi_hi as i128) << 96)
-                | ((parts.hi_lo as i128) << 64)
-                | ((parts.lo_hi as i128) << 32)
-                | (parts.lo_lo as i128);
-            Json::String(val.to_string())
-        }
+        ScVal::U256(parts) => Json::String(u256_limbs_to_decimal([
+            parts.hi_hi,
+            parts.hi_lo,
+            parts.lo_hi,
+            parts.lo_lo,
+        ])),
+        ScVal::I256(parts) => Json::String(i256_limbs_to_decimal(
+            parts.hi_hi,
+            parts.hi_lo,
+            parts.lo_hi,
+            parts.lo_lo,
+        )),
         ScVal::Bytes(b) => Json::String(hex::encode(b.as_slice())),
         ScVal::Address(addr) => Json::String(scaddress_to_string(addr)),
+        // u64-valued, so emitted as strings for the same reason U64/I64 are:
+        // values above 2^53 do not survive a JSON number round-trip through a
+        // JavaScript consumer (issue #415).
+        ScVal::Timepoint(t) => Json::String(t.0.to_string()),
+        ScVal::Duration(d) => Json::String(d.0.to_string()),
+        ScVal::Error(e) => Json::String(format!("{e:?}")),
         ScVal::Vec(Some(items)) => Json::Array(items.iter().map(scval_to_json).collect()),
         ScVal::Vec(None) => Json::Array(vec![]),
         ScVal::Map(Some(entries)) => {
@@ -310,7 +381,10 @@ pub fn scval_to_json(val: &ScVal) -> Json {
             Json::Object(obj)
         }
         ScVal::Map(None) => Json::Object(serde_json::Map::new()),
-        other => Json::String(format!("{other:?}")),
+        other => {
+            crate::metrics::record_unhandled_scvariant();
+            Json::String(format!("{other:?}"))
+        }
     }
 }
 
@@ -333,8 +407,8 @@ mod tests {
     use super::*;
     use base64::{engine::general_purpose::STANDARD, Engine};
     use stellar_xdr::curr::{
-        AccountId, ContractId, Hash, Int128Parts, Limited, Limits, PublicKey, ScAddress, ScMap,
-        ScMapEntry, ScSymbol, ScVal, Uint256, VecM, WriteXdr,
+        AccountId, BytesM, ContractId, Hash, Int128Parts, Limited, Limits, PublicKey, ScAddress,
+        ScMap, ScMapEntry, ScString, ScSymbol, ScVal, Uint256, VecM, WriteXdr,
     };
 
     use crate::rpc::RawEvent;
@@ -852,5 +926,504 @@ mod tests {
         let token = parsed.token.expect("transfer must produce a projection");
         assert!(token.asset_code.is_none());
         assert!(token.asset_issuer.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // ScVal variant coverage (issue #415)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn scval_to_string_bool_true() {
+        assert_eq!(scval_to_string(&ScVal::Bool(true)), "true");
+    }
+
+    #[test]
+    fn scval_to_string_bool_false() {
+        assert_eq!(scval_to_string(&ScVal::Bool(false)), "false");
+    }
+
+    #[test]
+    fn scval_to_string_string() {
+        // Construct via XDR round-trip since ScString wraps StringM.
+        let sm = stellar_xdr::curr::StringM::try_from(b"hello".to_vec()).unwrap();
+        let val = ScVal::String(ScString(sm));
+        assert_eq!(scval_to_string(&val), "hello");
+    }
+
+    #[test]
+    fn scval_to_string_u32() {
+        assert_eq!(scval_to_string(&ScVal::U32(42)), "42");
+    }
+
+    #[test]
+    fn scval_to_string_i32() {
+        assert_eq!(scval_to_string(&ScVal::I32(-7)), "-7");
+    }
+
+    #[test]
+    fn scval_to_string_u64() {
+        assert_eq!(
+            scval_to_string(&ScVal::U64(u64::MAX)),
+            "18446744073709551615"
+        );
+    }
+
+    #[test]
+    fn scval_to_string_i64() {
+        assert_eq!(
+            scval_to_string(&ScVal::I64(i64::MIN)),
+            "-9223372036854775808"
+        );
+    }
+
+    // Large-integer variants (issue #415). The decoder handles these but
+    // nothing covered them, which is how the 256-bit packing bug below
+    // survived: it produces a plausible-looking number, just the wrong one.
+    #[test]
+    fn scval_to_string_u128_uses_full_width() {
+        let val = ScVal::U128(stellar_xdr::curr::UInt128Parts { hi: 1, lo: 0 });
+        // hi=1 means 2^64, not 1.
+        assert_eq!(scval_to_string(&val), "18446744073709551616");
+    }
+
+    #[test]
+    fn scval_to_string_u128_max() {
+        let val = ScVal::U128(stellar_xdr::curr::UInt128Parts {
+            hi: u64::MAX,
+            lo: u64::MAX,
+        });
+        assert_eq!(scval_to_string(&val), u128::MAX.to_string());
+    }
+
+    #[test]
+    fn scval_to_string_i128_negative() {
+        // -1 as two's complement across the two halves.
+        let val = ScVal::I128(Int128Parts {
+            hi: -1,
+            lo: u64::MAX,
+        });
+        assert_eq!(scval_to_string(&val), "-1");
+    }
+
+    #[test]
+    fn scval_to_string_i128_min() {
+        let val = ScVal::I128(Int128Parts {
+            hi: i64::MIN,
+            lo: 0,
+        });
+        assert_eq!(scval_to_string(&val), i128::MIN.to_string());
+    }
+
+    #[test]
+    fn u256_decodes_beyond_128_bits() {
+        // hi_hi=1 means 2^192. The previous implementation packed all four
+        // limbs into a u128 with 32-bit shifts, so this decoded to a wrong
+        // (much smaller) number rather than failing loudly.
+        let val = ScVal::U256(stellar_xdr::curr::UInt256Parts {
+            hi_hi: 1,
+            hi_lo: 0,
+            lo_hi: 0,
+            lo_lo: 0,
+        });
+        assert_eq!(
+            scval_to_string(&val),
+            "6277101735386680763835789423207666416102355444464034512896"
+        );
+    }
+
+    #[test]
+    fn u256_max_is_exact() {
+        let val = ScVal::U256(stellar_xdr::curr::UInt256Parts {
+            hi_hi: u64::MAX,
+            hi_lo: u64::MAX,
+            lo_hi: u64::MAX,
+            lo_lo: u64::MAX,
+        });
+        assert_eq!(
+            scval_to_string(&val),
+            "115792089237316195423570985008687907853269984665640564039457584007913129639935"
+        );
+    }
+
+    #[test]
+    fn u256_small_value_round_trips() {
+        let val = ScVal::U256(stellar_xdr::curr::UInt256Parts {
+            hi_hi: 0,
+            hi_lo: 0,
+            lo_hi: 0,
+            lo_lo: 12345,
+        });
+        assert_eq!(scval_to_string(&val), "12345");
+    }
+
+    #[test]
+    fn i256_negative_one() {
+        // -1 is all bits set across every limb.
+        let val = ScVal::I256(stellar_xdr::curr::Int256Parts {
+            hi_hi: -1,
+            hi_lo: u64::MAX,
+            lo_hi: u64::MAX,
+            lo_lo: u64::MAX,
+        });
+        assert_eq!(scval_to_string(&val), "-1");
+    }
+
+    #[test]
+    fn i256_min_is_exact() {
+        let val = ScVal::I256(stellar_xdr::curr::Int256Parts {
+            hi_hi: i64::MIN,
+            hi_lo: 0,
+            lo_hi: 0,
+            lo_lo: 0,
+        });
+        assert_eq!(
+            scval_to_string(&val),
+            "-57896044618658097711785492504343953926634992332820282019728792003956564819968"
+        );
+    }
+
+    // Timepoint/Duration/Error (issue #415). Before these arms existed all
+    // three fell through to the debug catch-all, so they rendered as
+    // "Timepoint(1700000000)" and incremented the unhandled-variant metric
+    // despite being fully understood types.
+    #[test]
+    fn scval_to_string_timepoint() {
+        let val = ScVal::Timepoint(stellar_xdr::curr::TimePoint(1_700_000_000));
+        assert_eq!(scval_to_string(&val), "1700000000");
+    }
+
+    #[test]
+    fn scval_to_string_duration() {
+        let val = ScVal::Duration(stellar_xdr::curr::Duration(86_400));
+        assert_eq!(scval_to_string(&val), "86400");
+    }
+
+    #[test]
+    fn scval_to_json_timepoint_and_duration_are_strings() {
+        // u64-valued, so they must not become JSON numbers: anything above
+        // 2^53 loses precision in a JavaScript consumer.
+        let tp = ScVal::Timepoint(stellar_xdr::curr::TimePoint(u64::MAX));
+        assert_eq!(
+            scval_to_json(&tp),
+            Json::String("18446744073709551615".to_string())
+        );
+        let d = ScVal::Duration(stellar_xdr::curr::Duration(u64::MAX));
+        assert_eq!(
+            scval_to_json(&d),
+            Json::String("18446744073709551615".to_string())
+        );
+    }
+
+    #[test]
+    fn timepoint_does_not_count_as_unhandled_variant() {
+        // The point of the dedicated arms: a known type must not trip the
+        // unhandled-variant signal, or that metric stops meaning anything.
+        let val = ScVal::Timepoint(stellar_xdr::curr::TimePoint(1));
+        let rendered = scval_to_string(&val);
+        assert!(
+            !rendered.contains("Timepoint"),
+            "rendered via the debug catch-all: {rendered}"
+        );
+    }
+
+    #[test]
+    fn scval_to_json_bytes_is_hex_not_base64() {
+        // docs/soroban-event-model.md claimed base64 for ScvBytes while the
+        // code has always emitted hex. Pinning the real behaviour so the doc
+        // and the encoder cannot drift apart again.
+        let val = ScVal::Bytes(stellar_xdr::curr::ScBytes(
+            BytesM::try_from(vec![0xDE, 0xAD, 0xBE, 0xEF]).unwrap(),
+        ));
+        assert_eq!(scval_to_json(&val), Json::String("deadbeef".to_string()));
+    }
+
+    #[test]
+    fn scval_to_string_bytes() {
+        let val = ScVal::Bytes(stellar_xdr::curr::ScBytes(
+            BytesM::try_from(vec![0xDE, 0xAD, 0xBE, 0xEF]).unwrap(),
+        ));
+        assert_eq!(scval_to_string(&val), "deadbeef");
+    }
+
+    #[test]
+    fn scval_to_string_vec_some() {
+        let items = VecM::try_from(vec![ScVal::U32(1), ScVal::U32(2)]).unwrap();
+        let val = ScVal::Vec(Some(stellar_xdr::curr::ScVec(items)));
+        let s = scval_to_string(&val);
+        assert!(s.contains('1'));
+        assert!(s.contains('2'));
+    }
+
+    #[test]
+    fn scval_to_string_vec_none() {
+        assert_eq!(scval_to_string(&ScVal::Vec(None)), "Vec(None)");
+    }
+
+    #[test]
+    fn scval_to_json_bool() {
+        assert_eq!(scval_to_json(&ScVal::Bool(true)), Json::Bool(true));
+        assert_eq!(scval_to_json(&ScVal::Bool(false)), Json::Bool(false));
+    }
+
+    #[test]
+    fn scval_to_json_string() {
+        let sm = stellar_xdr::curr::StringM::try_from(b"world".to_vec()).unwrap();
+        let val = ScVal::String(ScString(sm));
+        assert_eq!(scval_to_json(&val), Json::String("world".to_string()));
+    }
+
+    #[test]
+    fn scval_to_json_u32() {
+        assert_eq!(scval_to_json(&ScVal::U32(99)), Json::from(99u32));
+    }
+
+    #[test]
+    fn scval_to_json_i32() {
+        assert_eq!(scval_to_json(&ScVal::I32(-3)), Json::from(-3i32));
+    }
+
+    #[test]
+    fn scval_to_json_u64() {
+        assert_eq!(scval_to_json(&ScVal::U64(123)), Json::from(123u64));
+    }
+
+    #[test]
+    fn scval_to_json_i64() {
+        assert_eq!(scval_to_json(&ScVal::I64(-456)), Json::from(-456i64));
+    }
+
+    #[test]
+    fn scval_to_json_bytes() {
+        let val = ScVal::Bytes(stellar_xdr::curr::ScBytes(
+            BytesM::try_from(vec![0xCA, 0xFE]).unwrap(),
+        ));
+        assert_eq!(scval_to_json(&val), Json::String("cafe".to_string()));
+    }
+
+    #[test]
+    fn scval_to_json_vec_some() {
+        let items = VecM::try_from(vec![ScVal::U32(10), ScVal::U32(20)]).unwrap();
+        let val = ScVal::Vec(Some(stellar_xdr::curr::ScVec(items)));
+        let json = scval_to_json(&val);
+        let arr = json.as_array().expect("Vec(Some) must be a JSON array");
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0], Json::from(10u32));
+        assert_eq!(arr[1], Json::from(20u32));
+    }
+
+    #[test]
+    fn scval_to_json_vec_none() {
+        let json = scval_to_json(&ScVal::Vec(None));
+        let arr = json
+            .as_array()
+            .expect("Vec(None) must be an empty JSON array");
+        assert!(arr.is_empty());
+    }
+
+    #[test]
+    fn scval_to_json_void() {
+        assert_eq!(scval_to_json(&ScVal::Void), Json::Null);
+    }
+
+    #[test]
+    fn decode_scval_round_trip() {
+        // Encode a ScVal to XDR, base64, decode, and verify it matches.
+        let original = ScVal::U64(42);
+        let b64 = xdr_b64(&original);
+        let decoded = decode_scval(&b64).unwrap();
+        assert_eq!(scval_to_string(&decoded), "42");
+    }
+
+    #[test]
+    fn decode_scval_rejects_garbage() {
+        assert!(decode_scval("not-valid-base64!!!").is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Dead-letter / poison-event tests (issue #414)
+    //
+    // Verifies that events with corrupt XDR payloads produce a clean error
+    // (not a panic) so the streamer can dead-letter them and advance the
+    // cursor past the poison event.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn poison_event_with_corrupt_topic_returns_error_not_panic() {
+        let raw = RawEvent {
+            event_type: "contract".to_string(),
+            ledger: "500".to_string(),
+            ledger_closed_at: "2024-06-01T00:00:00Z".to_string(),
+            contract_id: Some("CA".to_string()),
+            id: "0000000000500000-0".to_string(),
+            paging_token: None,
+            tx_hash: "deadbeef".to_string(),
+            operation_index: None,
+            topic: vec!["not-valid-xdr!!!".to_string()],
+            value: "AAAAAQ==".to_string(), // valid XDR: ScVal::U32(1)
+            in_successful_contract_call: true,
+        };
+
+        let parser = Parser::new(false);
+        let result = parser.parse_event_with_projection(&raw);
+        assert!(result.is_err(), "corrupt topic must produce an error");
+    }
+
+    #[test]
+    fn poison_event_with_corrupt_value_returns_error_not_panic() {
+        let raw = RawEvent {
+            event_type: "contract".to_string(),
+            ledger: "500".to_string(),
+            ledger_closed_at: "2024-06-01T00:00:00Z".to_string(),
+            contract_id: None,
+            id: "0000000000500000-0".to_string(),
+            paging_token: None,
+            tx_hash: "deadbeef".to_string(),
+            operation_index: None,
+            topic: vec!["AAAAAA==".to_string()], // valid XDR: ScVal::Void
+            value: "garbage!!!".to_string(),
+            in_successful_contract_call: true,
+        };
+
+        let parser = Parser::new(false);
+        let result = parser.parse_event_with_projection(&raw);
+        assert!(result.is_err(), "corrupt value must produce an error");
+    }
+
+    #[test]
+    fn valid_event_after_poison_event_can_still_parse() {
+        // Simulates two events in sequence: the first is poison, the second
+        // is valid. The parser is stateless so the second must succeed
+        // independently — the streamer can advance the cursor past the first.
+        let poison = RawEvent {
+            event_type: "contract".to_string(),
+            ledger: "500".to_string(),
+            ledger_closed_at: "2024-06-01T00:00:00Z".to_string(),
+            contract_id: None,
+            id: "0000000000500000-0".to_string(),
+            paging_token: None,
+            tx_hash: "deadbeef".to_string(),
+            operation_index: None,
+            topic: vec!["not-valid-xdr!!!".to_string()],
+            value: "AAAAAQ==".to_string(),
+            in_successful_contract_call: true,
+        };
+
+        let valid = make_event("contract", None, vec![sym("transfer")], ScVal::Void, true);
+
+        let parser = Parser::new(false);
+        assert!(parser.parse_event_with_projection(&poison).is_err());
+        assert!(parser
+            .parse_event_with_projection(&valid)
+            .unwrap()
+            .is_some());
+    }
+
+    // -----------------------------------------------------------------------
+    // Property-based fuzz tests (issue #416)
+    // -----------------------------------------------------------------------
+
+    use proptest::prelude::*;
+
+    /// Generate random base64-encoded XDR from arbitrary ScVal values.
+    fn arb_scval_b64() -> impl Strategy<Value = String> {
+        // At least 9 bytes: the arms below index up to bytes[8] to fill a
+        // u64/i64. A shorter vector panics inside the generator itself,
+        // so the test fails before the parser is ever called.
+        proptest::collection::vec(any::<u8>(), 9..128).prop_map(|bytes| {
+            let discriminant = bytes[0] % 6;
+            let val = match discriminant {
+                0 => ScVal::Void,
+                1 => ScVal::Bool(bytes[1] % 2 == 0),
+                2 => ScVal::U32(u32::from_le_bytes([bytes[1], bytes[2], bytes[3], bytes[4]])),
+                3 => ScVal::I32(i32::from_le_bytes([bytes[1], bytes[2], bytes[3], bytes[4]])),
+                4 => ScVal::U64(u64::from_le_bytes([
+                    bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7], bytes[8],
+                ])),
+                _ => ScVal::I64(i64::from_le_bytes([
+                    bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7], bytes[8],
+                ])),
+            };
+            xdr_b64(&val)
+        })
+    }
+
+    /// Generate arbitrary raw base64 (may not be valid XDR).
+    fn arb_raw_b64() -> impl Strategy<Value = String> {
+        proptest::collection::vec(any::<u8>(), 0..256)
+            .prop_map(|bytes| base64::engine::general_purpose::STANDARD.encode(&bytes))
+    }
+
+    /// Generate arbitrary ScVal values.
+    fn arb_scval_val() -> impl Strategy<Value = ScVal> {
+        // At least 9 bytes: the arms below index up to bytes[8] to fill a
+        // u64/i64. A shorter vector panics inside the generator itself,
+        // so the test fails before the parser is ever called.
+        proptest::collection::vec(any::<u8>(), 9..128).prop_map(|bytes| {
+            let d = bytes[0] % 8;
+            match d {
+                0 => ScVal::Void,
+                1 => ScVal::Bool(bytes[1] % 2 == 0),
+                2 => ScVal::U32(u32::from_le_bytes([bytes[1], bytes[2], bytes[3], bytes[4]])),
+                3 => ScVal::I32(i32::from_le_bytes([bytes[1], bytes[2], bytes[3], bytes[4]])),
+                4 => ScVal::U64(u64::from_le_bytes([
+                    bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7], bytes[8],
+                ])),
+                5 => ScVal::I64(i64::from_le_bytes([
+                    bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7], bytes[8],
+                ])),
+                6 => ScVal::Symbol(
+                    ScSymbol::try_from(
+                        String::from_utf8_lossy(&bytes[1..std::cmp::min(32, bytes.len())])
+                            .into_owned(),
+                    )
+                    .unwrap_or_else(|_| ScSymbol::try_from("x".to_string()).unwrap()),
+                ),
+                _ => ScVal::Bytes(stellar_xdr::curr::ScBytes(
+                    BytesM::try_from(bytes[1..std::cmp::min(64, bytes.len())].to_vec())
+                        .unwrap_or_default(),
+                )),
+            }
+        })
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(2000))]
+
+        #[test]
+        fn decode_scval_never_panics_on_arbitrary_xdr(b64 in arb_scval_b64()) {
+            let _ = decode_scval(&b64);
+        }
+
+        #[test]
+        fn decode_scval_never_panics_on_random_bytes(b64 in arb_raw_b64()) {
+            let _ = decode_scval(&b64);
+        }
+
+        #[test]
+        fn scval_to_string_never_panics(val in arb_scval_val()) {
+            let _ = scval_to_string(&val);
+        }
+
+        #[test]
+        fn scval_to_json_never_panics(val in arb_scval_val()) {
+            let _ = scval_to_json(&val);
+        }
+
+        #[test]
+        fn scval_to_json_output_is_valid_json(val in arb_scval_val()) {
+            let json = scval_to_json(&val);
+            let s = serde_json::to_string(&json).expect("scval_to_json must produce valid JSON");
+            let _: serde_json::Value = serde_json::from_str(&s).expect("JSON round-trip must succeed");
+        }
+
+        #[test]
+        fn decode_then_scval_to_string_roundtrip(b64 in arb_scval_b64()) {
+            if let Ok(val) = decode_scval(&b64) {
+                let s = scval_to_string(&val);
+                if !matches!(val, ScVal::Void) {
+                    assert!(!s.is_empty(), "scval_to_string must not return empty for non-Void");
+                }
+            }
+        }
     }
 }

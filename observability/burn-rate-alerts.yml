@@ -106,17 +106,19 @@ groups:
 
   # ---------------------------------------------------------------------------
   # Stubbed — do not enable until issue #295 (RED metrics for services/api)
-  # ships http_requests_total / http_request_duration_seconds with route and
-  # status_code labels. See docs/slo.md SLO 2 / SLO 3 for the target query
-  # shapes these rules should eventually mirror.
+  # ships the full set of labels needed for SLO 2/3. The metrics exist today
+  # as trident_api_http_requests_total and
+  # trident_api_http_request_duration_seconds (services/api/middleware/metrics.go),
+  # but are still being validated against production traffic patterns before
+  # burn-rate thresholds can be confidently set. See docs/slo.md SLO 2 / SLO 3.
   # ---------------------------------------------------------------------------
   # - name: trident-slo-api-latency-availability
   #   rules:
   #     - record: trident:api_availability_error_ratio5m
   #       expr: |
   #         1 - (
-  #           sum(rate(http_requests_total{status_code!~"5.."}[5m]))
+  #           sum(rate(trident_api_http_requests_total{status!~"5.."}[5m]))
   #           /
-  #           sum(rate(http_requests_total[5m]))
+  #           sum(rate(trident_api_http_requests_total[5m]))
   #         )
   #     # ... mirror the fast/slow burn pattern above once the metric exists.

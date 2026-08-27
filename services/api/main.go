@@ -129,6 +129,7 @@ func initTracer(ctx context.Context) func() {
 }
 
 func main() {
+	initLogger()
 	shutdownTracer := initTracer(context.Background())
 	defer shutdownTracer()
 
@@ -281,6 +282,7 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/health", handlers.Health())
 	mux.HandleFunc("GET /v1/ready", handlers.Ready(healthDB, redisClient, grpcClient))
+	mux.HandleFunc("GET /v1/version", handlers.VersionHandler(pool))
 	mux.HandleFunc("GET /v1/events", handlers.ListEvents)
 	mux.HandleFunc("POST /v1/events/batch", handlers.BatchGetEvents)
 	mux.HandleFunc("GET /v1/events/{id}", handlers.GetEvent)

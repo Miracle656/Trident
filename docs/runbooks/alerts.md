@@ -18,7 +18,7 @@ what "behind" means. The 10-minute `for` absorbs normal RPC jitter and brief
 upstream slowdowns without paging.
 
 **First steps:**
-1. Check `trident_indexer_rpc_request_duration_seconds` and
+1. Check `trident_indexer_rpc_call_duration_seconds` and
    `trident_indexer_rpc_errors_total` — is the Stellar RPC node slow or
    erroring? (see `TridentIndexerRPCErrorRateHigh` below)
 2. Check `trident_indexer_db_pool_size`/`_idle_connections` — is the
@@ -43,7 +43,7 @@ just slow.
 
 ## TridentIndexerHeartbeatStale
 
-**Means:** `trident_indexer_heartbeat_timestamp_seconds` — updated once per
+**Means:** `trident_indexer_last_poll_timestamp_seconds` — updated once per
 poll-loop iteration regardless of outcome — hasn't advanced in over 5
 minutes.
 
@@ -65,7 +65,7 @@ running slowly.
 
 ## TridentIndexerMetricsMissing
 
-**Means:** no `trident_indexer_heartbeat_timestamp_seconds` series exists at
+**Means:** no `trident_indexer_last_poll_timestamp_seconds` series exists at
 all — Prometheus can't find the metric, as opposed to finding it stale.
 
 **Why this threshold:** distinguishes "the indexer is emitting metrics but
@@ -122,7 +122,7 @@ load; 5% sustained for 10 minutes is well above normal noise and usually
 means the upstream node is degraded or rate-limiting.
 
 **First steps:**
-1. Check `trident_indexer_rpc_request_duration_seconds` for the same method
+1. Check `trident_indexer_rpc_call_duration_seconds` for the same method
    — is latency also elevated (overload) or normal (outright rejections)?
 2. Check the RPC provider's status page / try a manual `getHealth` call
    against `STELLAR_RPC_URL`.
@@ -221,3 +221,267 @@ absorbs on its own.
    `GO_API_DB_POOL_SIZE`, or a leak/regression?
 3. As a mitigation, `GO_API_DB_POOL_SIZE` can be raised without a code
    change, but treat it as a stopgap if the root cause is a query regression.
+
+
+---
+
+## Observability RPC alerts (observability/rpc-alerts.yml)
+
+The following alerts monitor Stellar RPC provider health — latency, error
+rate, and failover state — so ops can see "RPC is degraded" before it turns
+into ingest lag.
+
+## TridentRPCHighErrorRate
+
+**Means:** over 10% of Stellar RPC calls have failed over the last 5 minutes,
+sustained for 5 minutes.
+
+**Why this threshold:** 10% sustained error rate indicates the upstream RPC
+node is degraded, rate-limiting, or unreachable — not just isolated
+transient failures. This is a leading indicator that will turn into ingest
+lag if not addressed.
+
+**First steps:**
+1. Check `trident_indexer_rpc_errors_total` and break down by `error_type`
+   to distinguish rate-limited vs timing-out vs bad request shape.
+2. Check `trident_indexer_rpc_active_endpoint` to see if failover has
+   already kicked in to a secondary RPC provider.
+3. Check the RPC provider's status page or try a manual health check against
+   `STELLAR_RPC_URL`.
+
+**Known causes:**
+- RPC provider under load or rate-limiting
+- Network partition between indexer and RPC endpoint
+- Invalid cursor/pagination state (check for `invalid_cursor` error_type)
+
+**Mitigation:** configure a fallback RPC endpoint if one exists; consider
+raising rate limits with the provider.
+
+**Escalation:** if sustained for >15 minutes and no fallback is available,
+escalate to the RPC provider or switch endpoints.
+
+## TridentRPCHighLatency
+
+**Means:** p95 latency for a specific RPC method (e.g., `getEvents`) has
+exceeded 5 seconds, sustained for 10 minutes.
+
+**Why this threshold:** 5s p95 is a degraded-but-still-responding provider,
+distinct from outright timeouts. Left unaddressed, high latency typically
+turns into ingest lag as the indexer's poll loop spends most of its time
+waiting on slow RPC responses.
+
+**First steps:**
+1. Check which method is slow: break down
+   `trident_indexer_rpc_call_duration_seconds` by `method` label.
+2. Check if this correlates with elevated error rate
+   (`TridentRPCHighErrorRate`) — often both fire together when the provider
+   is overloaded.
+3. Check `trident_indexer_rpc_timeouts_total` — are requests timing out
+   entirely, or just responding slowly?
+
+**Known causes:**
+- RPC provider under load
+- Large response payloads (many events per ledger)
+- Network congestion between indexer and RPC endpoint
+
+**Mitigation:** if a secondary RPC endpoint is available, consider manual
+failover or allowing the automatic failover logic to switch.
+
+**Escalation:** if sustained for >30 minutes, escalate to the RPC provider
+or investigate network path.
+
+## TridentRPCFailoverActive
+
+**Means:** `trident_indexer_rpc_active_endpoint` has been non-zero (not the
+primary) for at least 5 minutes — the indexer is running on a fallback RPC
+endpoint.
+
+**Why this threshold:** failover is working as designed to keep the indexer
+running when the primary is down. This alert is informational ("you're on
+backup power") rather than urgent, but should be investigated before the
+backup fails too.
+
+**First steps:**
+1. Check `trident_indexer_rpc_failovers_total` to see how often failover has
+   occurred — frequent flapping suggests both endpoints are unstable.
+2. Check whether the primary RPC endpoint has recovered — try a manual health
+   check or `getHealth` call.
+3. Check `trident_indexer_rpc_errors_total` for the primary endpoint to see
+   why failover triggered.
+
+**Known causes:**
+- Primary RPC provider outage or maintenance window
+- Primary endpoint rate-limiting or rejecting requests
+- Network partition to primary endpoint
+
+**Mitigation:** if the primary has recovered, the indexer will automatically
+fail back on the next poll cycle (no manual intervention needed). If the
+primary is still down, ensure the fallback endpoint has sufficient capacity
+for sustained traffic.
+
+**Escalation:** if both primary and fallback are degraded, page on-call to
+add a third endpoint or escalate to RPC provider(s).
+
+## TridentRPCRateLimited
+
+**Means:** `trident_indexer_rpc_errors_total{error_type="rate_limited"}` has
+been climbing for 5+ minutes — the Stellar RPC provider is actively
+rate-limiting the indexer.
+
+**Why this threshold:** sustained rate-limiting degrades ingest freshness the
+same way an outage does, but is a distinct root cause (quota exhausted rather
+than provider down) that requires a different mitigation (raise quota vs fail
+over).
+
+**First steps:**
+1. Check the indexer's configured poll interval (`POLL_INTERVAL_MS`) — if
+   it's very aggressive (e.g., <1s), consider backing off slightly.
+2. Check `trident_indexer_rpc_call_duration_seconds_count` to estimate
+   request rate — are we exceeding the provider's documented limits?
+3. Check the RPC provider's dashboard/billing page to see current quota usage
+   and limits.
+
+**Known causes:**
+- Indexer poll rate exceeds RPC provider's quota
+- Other consumers sharing the same RPC quota
+- Provider has reduced quota limits (check provider changelog/announcements)
+
+**Mitigation:** raise the provider's quota if possible; add a secondary RPC
+endpoint to the pool to distribute load; back off poll interval slightly if
+latency tolerance allows.
+
+**Escalation:** if quota cannot be raised and no secondary endpoint is
+available, escalate to product/eng to prioritize RPC provider migration or
+multi-provider setup.
+
+---
+
+## SLO burn-rate alerts (observability/burn-rate-alerts.yml)
+
+The following alerts implement multi-window, multi-burn-rate monitoring for
+the SLOs defined in docs/slo.md (issue #296). They follow the Google SRE
+workbook pattern: a short window confirms the burn is happening *now*, a long
+window confirms it's sustained (not a blip) — both must breach before paging.
+
+## IngestFreshnessFastBurn
+
+**Means:** ledger lag has exceeded the 30s target (docs/slo.md SLO 1) for a
+large share of both the last 5 minutes and the last 1 hour, consuming the
+28-day error budget at 14.4x — exhausts the whole monthly budget in ~2 days
+if sustained.
+
+**Why this threshold:** fast burn (14.4x) is high enough to be page-worthy
+immediately — it's not a transient blip if both the 5m and 1h windows agree
+— but not so high that it triggers on every momentary spike.
+
+**First steps:**
+1. Check `trident_indexer_ledger_lag` current value — how far behind is the
+   indexer right now?
+2. Check `trident_indexer_rpc_retries_total` and
+   `trident_indexer_rpc_failovers_total` — is the RPC layer struggling?
+3. Check `trident_indexer_last_poll_timestamp_seconds` — is the poll loop
+   stalled entirely, or just slow?
+
+**Known causes:**
+- RPC provider degradation (see `TridentRPCHighErrorRate`,
+  `TridentRPCHighLatency`)
+- Database write path bottleneck (check `trident_indexer_db_pool_size` and
+  Postgres slow query log)
+- Indexer restart/deploy during high ledger activity
+
+**Mitigation:** if RPC is the bottleneck, fail over to a secondary endpoint
+or back off poll interval slightly; if DB is the bottleneck, scale the DB or
+increase the indexer's connection pool.
+
+**Escalation:** page on-call immediately — fast burn exhausts the monthly
+budget in under 2 days.
+
+## IngestFreshnessSlowBurn
+
+**Means:** ledger lag has exceeded 30s for a sustained share of both the last
+30 minutes and the last 6 hours, consuming the error budget at 6x — exhausts
+the budget in ~5 days if sustained.
+
+**Why this threshold:** slow burn (6x) is not urgent enough to page
+immediately, but indicates a sustained problem that needs investigation before
+it becomes a fast burn. The longer windows (30m/6h) filter out transient
+issues the fast-burn rule would already catch.
+
+**First steps:**
+1. Check the same diagnostic metrics as `IngestFreshnessFastBurn` but with
+   lower urgency — this is a leading indicator, not an active outage.
+2. Check whether this correlates with any recent deploys, config changes, or
+   upstream Stellar protocol upgrades.
+3. Review `trident_indexer_rpc_errors_total` and
+   `trident_indexer_parse_errors_total` for elevated rates.
+
+**Known causes:**
+- Slightly degraded RPC latency not yet crossing the `TridentRPCHighLatency`
+  threshold
+- Gradual increase in ledger activity (more events per ledger) without a
+  corresponding indexer capacity increase
+- Small config regression (e.g., poll interval accidentally increased)
+
+**Mitigation:** address the root cause before it becomes a fast burn —
+optimize indexer throughput, scale DB, or add RPC capacity.
+
+**Escalation:** create a ticket rather than paging — investigate during
+business hours before it escalates to fast burn.
+
+## IndexerHeartbeatStalled
+
+**Means:** `trident_indexer_last_poll_timestamp_seconds` has not advanced in
+over 2 minutes — the indexer poll loop has not completed a cycle.
+
+**Why this threshold:** this is a dead-man's-switch for the SLO: if the
+indexer dies outright or the metric stops being scraped, the lag-ratio alerts
+above can miss it (flat line looks healthy). 2 minutes is well above any
+reasonable poll interval, so staleness means the indexer is hung, crashed, or
+stuck retrying RPC.
+
+**First steps:**
+1. Check indexer process status (`kubectl get pods` or `docker compose ps`) —
+   is it running, restarting, or crashed?
+2. Check `trident_indexer_rpc_errors_total` — is it stuck retrying RPC
+   failures?
+3. If the process is alive but stalled, capture a stack dump/profile before
+   restarting.
+
+**Known causes:**
+- Indexer process crashed or killed (OOM, segfault, panic)
+- Poll loop deadlocked or blocked on I/O
+- RPC provider completely unreachable (not just slow or erroring, but
+  connection refused / timeout on every request)
+
+**Mitigation:** restart the indexer — the cursor is persisted in
+`system_state`, so restart is safe.
+
+**Escalation:** page on-call immediately — a stalled indexer violates the
+ingest-freshness SLO directly.
+
+## TridentIngestLagSustainedHigh
+
+**Means:** `trident_indexer_ledger_lag_seconds_estimated` (lag expressed in
+estimated wall-clock seconds, assuming ~5s per ledger) has been above 500s
+(~100 ledgers) for 10 minutes.
+
+**Why this threshold:** this is a direct, human-readable threshold alert
+independent of the error-budget/burn-rate math above. 100 ledgers (~8 minutes
+of lag) sustained for 10 minutes is well past "transient slowdown" and into
+"the indexer is falling behind." Mirrors the fields exposed by
+`GET /v1/stats/indexer` (docs/observability/data-freshness.md).
+
+**First steps:**
+1. Check `trident_indexer_ledger_lag` (the raw ledger-count lag) and
+   `trident_indexer_rpc_active_endpoint` to see if RPC failover has occurred.
+2. Check `trident_indexer_rpc_errors_total` — is the RPC provider the cause?
+3. Same diagnostic steps as `IngestFreshnessFastBurn` — this is an alternate
+   view of the same underlying problem.
+
+**Known causes:** same as `IngestFreshnessFastBurn` (RPC degradation, DB
+bottleneck, indexer restart during high activity).
+
+**Mitigation:** same as `IngestFreshnessFastBurn`.
+
+**Escalation:** page on-call — this crosses the "API consumers are reading
+meaningfully stale data" threshold.

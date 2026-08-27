@@ -33,6 +33,7 @@ scripts to match rather than the other way around.
 | `batch-load.js` | `POST /v1/events/batch` | `BASE_URL=http://localhost:3000 API_KEY=<key> k6 run load-tests/batch-load.js` |
 | `stats-load.js` | `GET /v1/stats/indexer`, `GET /v1/stats/contracts` | `BASE_URL=http://localhost:3000 API_KEY=<key> k6 run load-tests/stats-load.js` |
 | `stream-load.js` | `GET /v1/events/stream` (SSE) — connect-and-hold under concurrency | `BASE_URL=http://localhost:3000 API_KEY=<key> CONCURRENT_STREAMS=20 HOLD_SECONDS=30 k6 run load-tests/stream-load.js` |
+| `rate-limit-concurrency.js` | One-key burst proving the tier limit holds under launch-scale concurrency | `BASE_URL=http://localhost:3000 API_KEY=<key> EXPECTED_LIMIT=100 CONCURRENT_REQUESTS=1000 k6 run load-tests/rate-limit-concurrency.js` |
 | `ingest-soak.sh` | Sustained ingest volume (contract mint loop) + Go API / Rust indexer resource sampling over time | `LOCAL_RPC_URL=http://localhost:8000/rpc SOAK_DURATION_SECONDS=1800 ./load-tests/ingest-soak.sh` |
 
 `API_KEY` is optional for the k6 scripts — every script's checks accept
@@ -43,6 +44,12 @@ in `API_KEY_HASHES`/`api_keys` for the target environment.
 
 Every script accepts `BASE_URL`. Point it at staging, not just localhost, to
 get a capacity number that means something.
+
+`rate-limit-concurrency.js` requires a valid `API_KEY`. Set `EXPECTED_LIMIT`
+to that key's configured tier limit; the test fails if the concurrent burst
+allows more than that limit, does not reject the excess, or returns any status
+other than 200/429. Run it against an otherwise idle key so earlier requests in
+the same sliding window do not affect the expected boundary.
 
 ## Interpreting Results
 

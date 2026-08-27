@@ -373,7 +373,7 @@ func persistContractSchemas(ctx context.Context, db SchemaRegistryDB, contractID
                 field_schema = EXCLUDED.field_schema,
                 observed_source = EXCLUDED.observed_source,
                 updated_at = NOW()
-        `, contractID, network, schema.EventName, codeHash, payload, schema.Source); err != nil {
+        `, contractID, network, schema.EventName, codeHash, string(payload), schema.Source); err != nil {
 			return err
 		}
 	}

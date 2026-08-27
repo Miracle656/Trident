@@ -82,128 +82,226 @@ const DEFAULT_DB_POOL_SIZE: u32 = 3;
 
 impl Config {
     pub fn from_env() -> Result<Self, TridentError> {
-        let mut missing: Vec<&str> = Vec::new();
+        let mut errors: Vec<String> = Vec::new();
 
-        let database_url = collect_required("DATABASE_URL", &mut missing);
-        let redis_url = collect_required("REDIS_URL", &mut missing);
+        // ── Required env vars ───────────────────────────────────────────────
+        let database_url = collect_required("DATABASE_URL", &mut errors);
+        let redis_url = collect_required("REDIS_URL", &mut errors);
 
         // Endpoint list for failover (issue #213). STELLAR_RPC_URLS is the
         // prioritised, comma-separated form; STELLAR_RPC_URL remains valid as a
         // single-value alias so existing deployments keep working unchanged.
-        let stellar_rpc_urls = parse_endpoint_list(
+        let stellar_rpc_urls = match parse_endpoint_list(
             std::env::var("STELLAR_RPC_URLS").ok(),
             std::env::var("STELLAR_RPC_URL").ok(),
-        )?;
-        if stellar_rpc_urls.is_empty() {
-            missing.push("STELLAR_RPC_URL (or STELLAR_RPC_URLS)");
-        }
+        ) {
+            Ok(urls) => {
+                if urls.is_empty() {
+                    errors.push("[trident-indexer] STELLAR_RPC_URL (or STELLAR_RPC_URLS): at least one RPC endpoint is required, e.g. https://soroban-testnet.stellar.org".into());
+                }
+                urls
+            }
+            Err(e) => {
+                errors.push(format!("[trident-indexer] STELLAR_RPC_URL(S): {e}"));
+                Vec::new()
+            }
+        };
 
-        if !missing.is_empty() {
-            return Err(TridentError::config(anyhow::anyhow!(
-                "[trident-indexer] missing required env vars:\n{}",
-                missing.join("\n")
-            )));
-        }
-
+        // ── Network ─────────────────────────────────────────────────────────
         let network = std::env::var("NETWORK").unwrap_or_else(|_| "testnet".into());
 
         // Network passphrase for SAC contract id derivation (issue #262).
-        // NETWORK_PASSPHRASE always wins when set; otherwise it is inferred
-        // from the well-known "testnet"/"mainnet" friendly names, and any
-        // other `network` value must supply an explicit passphrase.
         let network_passphrase = match std::env::var("NETWORK_PASSPHRASE") {
             Ok(v) if !v.is_empty() => v,
-            _ => default_network_passphrase(&network)?,
+            _ => match default_network_passphrase(&network) {
+                Ok(v) => v,
+                Err(e) => {
+                    errors.push(format!("{e}"));
+                    String::new() // placeholder; won't be used if errors is non-empty
+                }
+            },
         };
 
-        // Tracked classic assets whose SAC events should carry asset context
-        // (issue #262), e.g. TRACKED_SAC_ASSETS="USDC:GA5Z...,native".
+        // Tracked classic assets whose SAC events should carry asset context.
         let tracked_sac_assets = match std::env::var("TRACKED_SAC_ASSETS") {
-            Ok(spec) if !spec.trim().is_empty() => parse_tracked_sac_assets(&spec)?,
+            Ok(spec) if !spec.trim().is_empty() => match parse_tracked_sac_assets(&spec) {
+                Ok(v) => v,
+                Err(e) => {
+                    errors.push(format!("{e}"));
+                    Vec::new()
+                }
+            },
             _ => Vec::new(),
         };
 
-        let poll_interval_ms = parse_bounded_u64("POLL_INTERVAL_MS", 1000, 100, 60_000)?;
-        let max_events_per_poll = parse_bounded_u64("MAX_EVENTS_PER_POLL", 200, 1, 10_000)?;
-        // Rows per batched INSERT (issue #199). Large enough that a default
-        // 200-event page commits in one statement, bounded so a huge page
-        // cannot build an unbounded statement.
-        let db_batch_size = parse_bounded_u64("DB_BATCH_SIZE", 1_000, 1, 10_000)?;
-
-        // Adaptive poll interval bounds (issue #198). Defaults: poll every 250ms
-        // while far behind, back off to 5s once caught up, cross over at 100
-        // ledgers of lag, with a 10-ledger hysteresis deadband.
-        let poll_interval_floor_ms = parse_bounded_u64("POLL_INTERVAL_FLOOR_MS", 250, 50, 60_000)?;
+        // ── Numeric ranges (all validated in one pass) ───────────────────────
+        let poll_interval_ms = parse_bounded_u64("POLL_INTERVAL_MS", 1000, 100, 60_000);
+        let max_events_per_poll = parse_bounded_u64("MAX_EVENTS_PER_POLL", 200, 1, 10_000);
+        let db_batch_size = parse_bounded_u64("DB_BATCH_SIZE", 1_000, 1, 10_000);
+        let poll_interval_floor_ms = parse_bounded_u64("POLL_INTERVAL_FLOOR_MS", 250, 50, 60_000);
         let poll_interval_ceiling_ms =
-            parse_bounded_u64("POLL_INTERVAL_CEILING_MS", 5000, 100, 600_000)?;
-        if poll_interval_ceiling_ms <= poll_interval_floor_ms {
-            return Err(TridentError::config(anyhow::anyhow!(
-                "[indexer] POLL_INTERVAL_CEILING_MS ({poll_interval_ceiling_ms}) must exceed POLL_INTERVAL_FLOOR_MS ({poll_interval_floor_ms})"
-            )));
-        }
-        let lag_high_watermark = parse_bounded_u64("LAG_HIGH_WATERMARK", 100, 1, 100_000_000)?;
+            parse_bounded_u64("POLL_INTERVAL_CEILING_MS", 5000, 100, 600_000);
+        let lag_high_watermark = parse_bounded_u64("LAG_HIGH_WATERMARK", 100, 1, 100_000_000);
         let poll_hysteresis_ledgers =
-            parse_bounded_u64("POLL_HYSTERESIS_LEDGERS", 10, 0, 1_000_000)?;
-
-        // RPC HTTP client timeouts and connection reuse (issue #214). Without an
-        // explicit timeout a hung TCP connection blocks a poll forever: the retry
-        // wrapper only reacts to returned errors, never to a call that never
-        // returns. Defaults: 5s connect, 30s overall request.
+            parse_bounded_u64("POLL_HYSTERESIS_LEDGERS", 10, 0, 1_000_000);
         let rpc_connect_timeout_ms =
-            parse_bounded_u64("RPC_CONNECT_TIMEOUT_MS", 5_000, 100, 60_000)?;
+            parse_bounded_u64("RPC_CONNECT_TIMEOUT_MS", 5_000, 100, 60_000);
         let rpc_request_timeout_ms =
-            parse_bounded_u64("RPC_REQUEST_TIMEOUT_MS", 30_000, 500, 600_000)?;
-        if rpc_request_timeout_ms < rpc_connect_timeout_ms {
-            return Err(TridentError::config(anyhow::anyhow!(
-                "[indexer] RPC_REQUEST_TIMEOUT_MS ({rpc_request_timeout_ms}) must be >= RPC_CONNECT_TIMEOUT_MS ({rpc_connect_timeout_ms})"
-            )));
-        }
+            parse_bounded_u64("RPC_REQUEST_TIMEOUT_MS", 30_000, 500, 600_000);
         let rpc_pool_idle_timeout_ms =
-            parse_bounded_u64("RPC_POOL_IDLE_TIMEOUT_MS", 90_000, 1_000, 600_000)?;
+            parse_bounded_u64("RPC_POOL_IDLE_TIMEOUT_MS", 90_000, 1_000, 600_000);
         let rpc_pool_max_idle_per_host =
-            parse_bounded_u64("RPC_POOL_MAX_IDLE_PER_HOST", 8, 1, 1_024)? as usize;
+            parse_bounded_u64("RPC_POOL_MAX_IDLE_PER_HOST", 8, 1, 1_024);
         let rpc_tcp_keepalive_ms =
-            parse_bounded_u64("RPC_TCP_KEEPALIVE_MS", 60_000, 1_000, 600_000)?;
-
-        // Failover tuning (issue #213): park an endpoint after this many
-        // consecutive failures, and probe it again after the cooldown.
-        let rpc_failover_threshold = parse_bounded_u64("RPC_FAILOVER_THRESHOLD", 3, 1, 100)? as u32;
+            parse_bounded_u64("RPC_TCP_KEEPALIVE_MS", 60_000, 1_000, 600_000);
+        let rpc_failover_threshold = parse_bounded_u64("RPC_FAILOVER_THRESHOLD", 3, 1, 100);
         let rpc_endpoint_cooldown_ms =
-            parse_bounded_u64("RPC_ENDPOINT_COOLDOWN_MS", 30_000, 1_000, 3_600_000)?;
-
-        // Outbox relay tuning (issue #200). The default 100ms interval keeps
-        // live delivery latency close to the direct-publish path while the
-        // bounded batch stops the relay starving the poll loop.
-        let outbox_poll_interval_ms =
-            parse_bounded_u64("OUTBOX_POLL_INTERVAL_MS", 100, 10, 60_000)?;
-        let outbox_batch_size = parse_bounded_u64("OUTBOX_BATCH_SIZE", 500, 1, 10_000)? as i64;
+            parse_bounded_u64("RPC_ENDPOINT_COOLDOWN_MS", 30_000, 1_000, 3_600_000);
+        let outbox_poll_interval_ms = parse_bounded_u64("OUTBOX_POLL_INTERVAL_MS", 100, 10, 60_000);
+        let outbox_batch_size = parse_bounded_u64("OUTBOX_BATCH_SIZE", 500, 1, 10_000);
         let outbox_backlog_alert_threshold =
-            parse_bounded_u64("OUTBOX_BACKLOG_ALERT_THRESHOLD", 10_000, 1, 10_000_000)? as i64;
+            parse_bounded_u64("OUTBOX_BACKLOG_ALERT_THRESHOLD", 10_000, 1, 10_000_000);
+        let alert_lag_threshold = parse_bounded_u64("ALERT_LAG_THRESHOLD", 200, 1, 1_000_000);
+        let alert_cooldown_minutes = parse_bounded_u64("ALERT_COOLDOWN_MINUTES", 30, 1, 10_080);
+        let statement_timeout_ms =
+            parse_bounded_u64("DB_STATEMENT_TIMEOUT_MS", 30_000, 100, 3_600_000);
+        let idle_in_transaction_timeout_ms =
+            parse_bounded_u64("DB_IDLE_IN_TRANSACTION_TIMEOUT_MS", 10_000, 100, 3_600_000);
+        let token_metadata_refresh_interval_secs = parse_bounded_u64(
+            "TOKEN_METADATA_REFRESH_INTERVAL_SECS",
+            86_400,
+            60,
+            2_592_000,
+        );
+        let db_pool_size = parse_pool_size("INDEXER_DB_POOL_SIZE", DEFAULT_DB_POOL_SIZE);
 
+        // Collect all parse/range errors at once.
+        for (key, result) in [
+            ("POLL_INTERVAL_MS", poll_interval_ms.as_ref()),
+            ("MAX_EVENTS_PER_POLL", max_events_per_poll.as_ref()),
+            ("DB_BATCH_SIZE", db_batch_size.as_ref()),
+            ("POLL_INTERVAL_FLOOR_MS", poll_interval_floor_ms.as_ref()),
+            (
+                "POLL_INTERVAL_CEILING_MS",
+                poll_interval_ceiling_ms.as_ref(),
+            ),
+            ("LAG_HIGH_WATERMARK", lag_high_watermark.as_ref()),
+            ("POLL_HYSTERESIS_LEDGERS", poll_hysteresis_ledgers.as_ref()),
+            ("RPC_CONNECT_TIMEOUT_MS", rpc_connect_timeout_ms.as_ref()),
+            ("RPC_REQUEST_TIMEOUT_MS", rpc_request_timeout_ms.as_ref()),
+            (
+                "RPC_POOL_IDLE_TIMEOUT_MS",
+                rpc_pool_idle_timeout_ms.as_ref(),
+            ),
+            (
+                "RPC_POOL_MAX_IDLE_PER_HOST",
+                rpc_pool_max_idle_per_host.as_ref(),
+            ),
+            ("RPC_TCP_KEEPALIVE_MS", rpc_tcp_keepalive_ms.as_ref()),
+            ("RPC_FAILOVER_THRESHOLD", rpc_failover_threshold.as_ref()),
+            (
+                "RPC_ENDPOINT_COOLDOWN_MS",
+                rpc_endpoint_cooldown_ms.as_ref(),
+            ),
+            ("OUTBOX_POLL_INTERVAL_MS", outbox_poll_interval_ms.as_ref()),
+            ("OUTBOX_BATCH_SIZE", outbox_batch_size.as_ref()),
+            (
+                "OUTBOX_BACKLOG_ALERT_THRESHOLD",
+                outbox_backlog_alert_threshold.as_ref(),
+            ),
+            ("ALERT_LAG_THRESHOLD", alert_lag_threshold.as_ref()),
+            ("ALERT_COOLDOWN_MINUTES", alert_cooldown_minutes.as_ref()),
+            ("DB_STATEMENT_TIMEOUT_MS", statement_timeout_ms.as_ref()),
+            (
+                "DB_IDLE_IN_TRANSACTION_TIMEOUT_MS",
+                idle_in_transaction_timeout_ms.as_ref(),
+            ),
+            (
+                "TOKEN_METADATA_REFRESH_INTERVAL_SECS",
+                token_metadata_refresh_interval_secs.as_ref(),
+            ),
+        ] {
+            if let Err(e) = result {
+                errors.push(format!("[indexer] {key}: {e}"));
+            }
+        }
+        // db_pool_size is u32, separate from the u64 batch above.
+        if let Err(e) = db_pool_size.as_ref() {
+            errors.push(format!("[indexer] INDEXER_DB_POOL_SIZE: {e}"));
+        }
+
+        // ── Cross-field relationship checks ──────────────────────────────────
+        if let (&Ok(floor), &Ok(ceiling)) = (&poll_interval_floor_ms, &poll_interval_ceiling_ms) {
+            if ceiling <= floor {
+                errors.push(format!(
+                    "[indexer] POLL_INTERVAL_CEILING_MS ({ceiling}) must exceed POLL_INTERVAL_FLOOR_MS ({floor})"
+                ));
+            }
+        }
+        if let (&Ok(conn), &Ok(req)) = (&rpc_connect_timeout_ms, &rpc_request_timeout_ms) {
+            if req < conn {
+                errors.push(format!(
+                    "[indexer] RPC_REQUEST_TIMEOUT_MS ({req}) must be >= RPC_CONNECT_TIMEOUT_MS ({conn})"
+                ));
+            }
+        }
+
+        // ── Optional settings (parsed but not fatal on failure) ──────────────
         let index_diagnostic = std::env::var("INDEX_DIAGNOSTIC")
             .map(|v| v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
 
-        // Optional server-side topic narrowing (issue #203), e.g.
-        // INDEX_TOPIC_FILTERS="transfer/*/*,mint/*/*". Only applied when a
-        // contract allowlist is configured; an invalid spec is a hard error
-        // rather than a silent fallback to unfiltered indexing.
         let topic_filters = match std::env::var("INDEX_TOPIC_FILTERS") {
-            Ok(spec) => crate::rpc::filters::parse_topic_filters(&spec).map_err(|e| {
-                TridentError::config(anyhow::anyhow!("[indexer] INDEX_TOPIC_FILTERS: {e}"))
-            })?,
+            Ok(spec) => match crate::rpc::filters::parse_topic_filters(&spec) {
+                Ok(f) => f,
+                Err(e) => {
+                    errors.push(format!("[indexer] INDEX_TOPIC_FILTERS: {e}"));
+                    Vec::new()
+                }
+            },
             Err(_) => Vec::new(),
         };
 
         let alert_webhook_url = std::env::var("ALERT_WEBHOOK_URL")
             .ok()
             .filter(|s| !s.is_empty());
-        let alert_lag_threshold = parse_bounded_u64("ALERT_LAG_THRESHOLD", 200, 1, 1_000_000)?;
-        let alert_cooldown_minutes = parse_bounded_u64("ALERT_COOLDOWN_MINUTES", 30, 1, 10_080)?;
+
+        // ── Bail if any errors were collected ────────────────────────────────
+        if !errors.is_empty() {
+            return Err(TridentError::config(anyhow::anyhow!(
+                "[trident-indexer] configuration errors (fix all and restart):\n{}",
+                errors.join("\n")
+            )));
+        }
+
+        // Unwrap is safe: all errors were collected above and we bailed.
+        let poll_interval_ms = poll_interval_ms.unwrap();
+        let max_events_per_poll = max_events_per_poll.unwrap();
+        let db_batch_size = db_batch_size.unwrap();
+        let poll_interval_floor_ms = poll_interval_floor_ms.unwrap();
+        let poll_interval_ceiling_ms = poll_interval_ceiling_ms.unwrap();
+        let lag_high_watermark = lag_high_watermark.unwrap();
+        let poll_hysteresis_ledgers = poll_hysteresis_ledgers.unwrap();
+        let rpc_connect_timeout_ms = rpc_connect_timeout_ms.unwrap();
+        let rpc_request_timeout_ms = rpc_request_timeout_ms.unwrap();
+        let rpc_pool_idle_timeout_ms = rpc_pool_idle_timeout_ms.unwrap();
+        let rpc_pool_max_idle_per_host = rpc_pool_max_idle_per_host.unwrap() as usize;
+        let rpc_tcp_keepalive_ms = rpc_tcp_keepalive_ms.unwrap();
+        let rpc_failover_threshold = rpc_failover_threshold.unwrap() as u32;
+        let rpc_endpoint_cooldown_ms = rpc_endpoint_cooldown_ms.unwrap();
+        let outbox_poll_interval_ms = outbox_poll_interval_ms.unwrap();
+        let outbox_batch_size = outbox_batch_size.unwrap() as i64;
+        let outbox_backlog_alert_threshold = outbox_backlog_alert_threshold.unwrap() as i64;
+        let alert_lag_threshold = alert_lag_threshold.unwrap();
+        let alert_cooldown_minutes = alert_cooldown_minutes.unwrap();
+        let statement_timeout_ms = statement_timeout_ms.unwrap();
+        let idle_in_transaction_timeout_ms = idle_in_transaction_timeout_ms.unwrap();
+        let token_metadata_refresh_interval_secs = token_metadata_refresh_interval_secs.unwrap();
+        let db_pool_size = db_pool_size.unwrap();
 
         Ok(Self {
             database_url: database_url.unwrap(),
-            db_pool_size: parse_pool_size("INDEXER_DB_POOL_SIZE", DEFAULT_DB_POOL_SIZE)?,
+            db_pool_size,
             redis_url: redis_url.unwrap(),
             stellar_rpc_url: stellar_rpc_urls[0].clone(),
             stellar_rpc_urls,
@@ -242,24 +340,11 @@ impl Config {
             alert_webhook_url,
             alert_lag_threshold,
             alert_cooldown_minutes,
-            statement_timeout_ms: parse_bounded_u64(
-                "DB_STATEMENT_TIMEOUT_MS",
-                30_000,
-                100,
-                3_600_000,
-            )?,
-            idle_in_transaction_timeout_ms: parse_bounded_u64(
-                "DB_IDLE_IN_TRANSACTION_TIMEOUT_MS",
-                10_000,
-                100,
-                3_600_000,
-            )?,
-            token_metadata_refresh_interval: Duration::from_secs(parse_bounded_u64(
-                "TOKEN_METADATA_REFRESH_INTERVAL_SECS",
-                86_400,
-                60,
-                2_592_000,
-            )?),
+            statement_timeout_ms,
+            idle_in_transaction_timeout_ms,
+            token_metadata_refresh_interval: Duration::from_secs(
+                token_metadata_refresh_interval_secs,
+            ),
             network_passphrase,
             tracked_sac_assets,
         })
@@ -315,12 +400,15 @@ fn parse_tracked_sac_assets(
     Ok(assets)
 }
 
-/// Read a required env var; on absence push its name to `missing` and return None.
-fn collect_required<'a>(key: &'a str, missing: &mut Vec<&'a str>) -> Option<String> {
+/// Read a required env var. Returns `Some(value)` on success, or pushes
+/// a descriptive error into `errors` and returns `None` on failure.
+fn collect_required(key: &str, errors: &mut Vec<String>) -> Option<String> {
     match std::env::var(key) {
         Ok(v) if !v.is_empty() => Some(v),
         _ => {
-            missing.push(key);
+            errors.push(format!(
+                "[indexer] {key} is required but not set (e.g. export {key}=<value>)"
+            ));
             None
         }
     }
@@ -467,6 +555,35 @@ mod tests {
 
         env::remove_var("DATABASE_URL");
         env::remove_var("STELLAR_RPC_URL");
+    }
+
+    #[test]
+    fn multiple_errors_accumulated_in_single_pass() {
+        let _guard = env_guard();
+        env::remove_var("DATABASE_URL");
+        env::remove_var("REDIS_URL");
+        env::remove_var("STELLAR_RPC_URL");
+        env::set_var("POLL_INTERVAL_MS", "50"); // below minimum
+        env::set_var("MAX_EVENTS_PER_POLL", "99999"); // above maximum
+
+        let err = Config::from_env().unwrap_err();
+        let msg = err.to_string();
+        // Required vars should all appear.
+        assert!(msg.contains("DATABASE_URL"), "missing DATABASE_URL");
+        assert!(msg.contains("REDIS_URL"), "missing REDIS_URL");
+        assert!(msg.contains("STELLAR_RPC_URL"), "missing STELLAR_RPC_URL");
+        // Out-of-range numeric vars should also appear.
+        assert!(
+            msg.contains("POLL_INTERVAL_MS"),
+            "missing POLL_INTERVAL_MS range error"
+        );
+        assert!(
+            msg.contains("MAX_EVENTS_PER_POLL"),
+            "missing MAX_EVENTS_PER_POLL range error"
+        );
+
+        env::remove_var("POLL_INTERVAL_MS");
+        env::remove_var("MAX_EVENTS_PER_POLL");
     }
 
     #[test]

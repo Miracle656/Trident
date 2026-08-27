@@ -91,6 +91,24 @@ jobs:
           DATABASE_URL: postgres://trident:password@localhost:5432/trident
         run: cargo test --all -- --test-threads=1
 
+      # Issue #416: the proptest suite already runs above as part of `cargo
+      # test`, but at its in-file case count. This step re-runs only the parser
+      # property tests with a much larger budget so CI does a real (if short)
+      # fuzz pass on every push, rather than relying on the default cases to
+      # stumble onto a crash. PROPTEST_CASES overrides the
+      # `ProptestConfig::with_cases` value at runtime.
+      #
+      # For longer campaigns, run locally with a bigger budget and a persisted
+      # corpus, e.g.:
+      #   PROPTEST_CASES=1000000 cargo test -p trident-indexer --bin trident-indexer parser::tests::
+      # Any input that trips a panic is written by proptest to
+      # crates/indexer/proptest-regressions/ — commit that file so the case
+      # becomes a permanent regression test.
+      - name: Fuzz the XDR parser (short run)
+        env:
+          PROPTEST_CASES: 50000
+        run: "cargo test -p trident-indexer --bin trident-indexer parser::tests:: -- --test-threads=1"
+
       - name: Show sccache stats
         if: always()
         run: sccache --show-stats
@@ -139,6 +157,16 @@ jobs:
                   exit 1
                 }
               }'
+
+      # Issue #455: report-only for now — extending to middleware and
+      # cursor handling, which the issue names as launch-critical paths.
+      # Not floor-enforced yet: doing that safely means measuring current
+      # coverage first and ratcheting up from there, not guessing a number
+      # that could fail CI on the very next merge.
+      - name: Middleware and cursor coverage (report only)
+        run: |
+          go test ./middleware ./cursor -coverprofile=critical-paths.out
+          go tool cover -func=critical-paths.out | tail -1
 
       # v8 is the first line of the action that supports golangci-lint v2. v4
       # invokes it with `--out-format`, which v2 removed, so the lint aborted
@@ -392,6 +420,33 @@ jobs:
           fi
 
   # ---------------------------------------------------------------------------
+  # Prometheus alert rules — promtool rule linting and unit tests (issue #392)
+  # ---------------------------------------------------------------------------
+  prometheus-alerts:
+    name: Prometheus Alert Rules
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      - name: Download promtool
+        run: |
+          PROM_VERSION="2.51.0"
+          curl -sSfL \
+            "https://github.com/prometheus/prometheus/releases/download/v${PROM_VERSION}/prometheus-${PROM_VERSION}.linux-amd64.tar.gz" \
+            | tar xz --strip-components=1 "prometheus-${PROM_VERSION}.linux-amd64/promtool"
+          chmod +x promtool
+          ./promtool --version
+
+      - name: Validate monitoring/alerts.yml
+        run: ./promtool check rules monitoring/alerts.yml
+
+      - name: Validate observability/burn-rate-alerts.yml
+        run: ./promtool check rules observability/burn-rate-alerts.yml
+
+      - name: Validate observability/rpc-alerts.yml
+        run: ./promtool check rules observability/rpc-alerts.yml
+
+  # ---------------------------------------------------------------------------
   # Rust integration tests — real Postgres + Redis
   # Runs integration tests that are silently skipped when TEST_DATABASE_URL
   # and TEST_REDIS_URL are absent. Scoped to push/PR against main and dev.
@@ -558,12 +613,18 @@ jobs:
   # so engineers can diagnose failures without re-running the job.
   # ---------------------------------------------------------------------------
   e2e:
-    name: E2E smoke test
+    name: E2E and OpenAPI contract test
     runs-on: ubuntu-latest
     needs: [rust, go, typescript, docker]
 
     steps:
       - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      - name: Set up Go
+        uses: actions/setup-go@0c52d547c9bc32b1aa3301fd7a9cb496313a4491 # v5.0.0
+        with:
+          go-version: "1.25"
+          cache-dependency-path: services/api/go.sum
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@2b51285047da1547ffb1b2203d8be4c0af6b1f20 # v3.2.0
@@ -614,6 +675,7 @@ jobs:
             -f docker/docker-compose.yml \
             -f docker/docker-compose.ci.yml \
             --env-file .env.ci \
+            --profile pgbouncer \
             up -d
 
       - name: Wait for Go API to become healthy
@@ -649,11 +711,11 @@ jobs:
         run: |
           cd docker
           echo "::group::container status"
-          docker compose -f docker-compose.yml -f docker-compose.ci.yml --env-file ../.env.ci ps -a
+          docker compose -f docker-compose.yml -f docker-compose.ci.yml --env-file ../.env.ci --profile pgbouncer ps -a
           echo "::endgroup::"
-          for svc in postgres redis grpc-api indexer api; do
+          for svc in postgres redis pgbouncer grpc-api indexer api; do
             echo "::group::${svc} logs"
-            docker compose -f docker-compose.yml -f docker-compose.ci.yml --env-file ../.env.ci logs --tail=120 "${svc}" || true
+            docker compose -f docker-compose.yml -f docker-compose.ci.yml --env-file ../.env.ci --profile pgbouncer logs --tail=120 "${svc}" || true
             echo "::endgroup::"
           done
 
@@ -687,6 +749,22 @@ jobs:
           # Validate the response is valid JSON — python3 will exit non-zero if not.
           echo "$RESPONSE" | python3 -c "import sys,json; data=json.load(sys.stdin); print('✓ /v1/events returned valid JSON')"
 
+      - name: Verify alert metrics exist (issue #393)
+        run: |
+          chmod +x scripts/verify-alert-metrics.sh
+          ./scripts/verify-alert-metrics.sh \
+            http://localhost:3000/metrics \
+            http://localhost:9090/metrics
+
+      - name: Validate every documented operation against OpenAPI
+        working-directory: services/api
+        env:
+          CONTRACTTEST_BASE_URL: http://localhost:3000
+          CONTRACTTEST_API_KEY: ci-test-api-key-do-not-use-in-production
+          CONTRACTTEST_ADMIN_KEY: ci-admin-key-do-not-use-in-production
+          CONTRACTTEST_REDIS_URL: redis://localhost:6380
+        run: go test ./internal/contracttest -run TestLiveOpenAPIContract -count=1 -v
+
       - name: Dump service logs
         # Always run so logs are available for both passing and failing runs.
         if: always()
@@ -696,6 +774,7 @@ jobs:
             -f docker/docker-compose.yml \
             -f docker/docker-compose.ci.yml \
             --env-file .env.ci \
+            --profile pgbouncer \
             ps
 
           echo "=== Service logs ==="
@@ -703,6 +782,7 @@ jobs:
             -f docker/docker-compose.yml \
             -f docker/docker-compose.ci.yml \
             --env-file .env.ci \
+            --profile pgbouncer \
             logs --no-color --timestamps
 
       - name: Tear down stack
@@ -713,6 +793,7 @@ jobs:
             -f docker/docker-compose.yml \
             -f docker/docker-compose.ci.yml \
             --env-file .env.ci \
+            --profile pgbouncer \
             down -v --remove-orphans
 
   # ---------------------------------------------------------------------------
@@ -1044,7 +1125,9 @@ jobs:
           kubectl create secret generic trident-secrets \
             --from-literal=DATABASE_URL="postgres://trident:trident@postgres:5432/trident" \
             --from-literal=REDIS_URL="redis://redis:6379" \
-            --from-literal=ADMIN_API_KEY="ci-admin-key"
+            --from-literal=ADMIN_API_KEY="ci-admin-key" \
+            --from-literal=API_KEY_SALT="not-a-production-secret-ci-salt" \
+            --from-literal=STELLAR_RPC_URL="https://soroban-testnet.stellar.org"
 
       # migrations.enabled=false alongside the busybox image overrides: the
       # migration Job is a pre-install hook, and Helm always waits on hooks

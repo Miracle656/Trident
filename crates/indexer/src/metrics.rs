@@ -26,6 +26,13 @@ pub const LEDGER_LAG_SECONDS_ESTIMATED: &str = "trident_indexer_ledger_lag_secon
 pub const EVENTS_TOTAL: &str = "trident_indexer_events_total";
 pub const EVENTS_SKIPPED_TOTAL: &str = "trident_indexer_events_skipped_total";
 pub const PARSE_ERRORS_TOTAL: &str = "trident_indexer_parse_errors_total";
+
+/// Incremented when an event exhausts its retry budget and is written to the
+/// parse-error (dead-letter) table so the poll can advance past it (issue
+/// #414). Distinct from PARSE_ERRORS_TOTAL, which counts every parse failure
+/// including ones that later succeed on retry: this counter only moves when an
+/// event is actually abandoned, which is what an alert should fire on.
+pub const DEAD_LETTERED_TOTAL: &str = "trident_indexer_dead_lettered_total";
 pub const POLL_DURATION_SECONDS: &str = "trident_indexer_poll_duration_seconds";
 pub const POLL_ERRORS_TOTAL: &str = "trident_indexer_poll_errors_total";
 pub const RPC_RETRIES_TOTAL: &str = "trident_indexer_rpc_retries_total";
@@ -33,6 +40,10 @@ pub const EFFECTIVE_POLL_INTERVAL_MS: &str = "trident_indexer_effective_poll_int
 pub const RPC_TIMEOUTS_TOTAL: &str = "trident_indexer_rpc_timeouts_total";
 pub const RPC_ACTIVE_ENDPOINT: &str = "trident_indexer_rpc_active_endpoint";
 pub const RPC_FAILOVERS_TOTAL: &str = "trident_indexer_rpc_failovers_total";
+/// Count of ScVal values that hit the catch-all / debug-format fallback in
+/// `scval_to_string` or `scval_to_json` (issue #415). A high rate means the
+/// indexer is encountering Soroban types it cannot render as structured data.
+pub const UNHANDLED_SCVARIANT_TOTAL: &str = "trident_indexer_unhandled_scvariant_total";
 pub const OUTBOX_BACKLOG: &str = "trident_indexer_outbox_backlog";
 pub const OUTBOX_PUBLISHED_TOTAL: &str = "trident_indexer_outbox_published_total";
 pub const OUTBOX_PUBLISH_FAILURES_TOTAL: &str = "trident_indexer_outbox_publish_failures_total";
@@ -122,6 +133,10 @@ pub fn install(port: u16) -> Result<(), TridentError> {
         OUTBOX_PUBLISH_FAILURES_TOTAL,
         "Outbox publish attempts that failed (issue #200)"
     );
+    describe_counter!(
+        UNHANDLED_SCVARIANT_TOTAL,
+        "ScVal values that hit the debug-format fallback (issue #415)"
+    );
     describe_gauge!(
         HEARTBEAT_TIMESTAMP,
         "Unix timestamp (seconds) of the most recent completed poll cycle (#218)"
@@ -158,6 +173,7 @@ pub fn install(port: u16) -> Result<(), TridentError> {
     counter!(RPC_FAILOVERS_TOTAL).increment(0);
     counter!(OUTBOX_PUBLISHED_TOTAL).increment(0);
     counter!(OUTBOX_PUBLISH_FAILURES_TOTAL).increment(0);
+    counter!(UNHANDLED_SCVARIANT_TOTAL).increment(0);
     gauge!(RPC_ACTIVE_ENDPOINT).set(0.0);
     gauge!(OUTBOX_BACKLOG).set(0.0);
     gauge!(LEDGER_LAG).set(0.0);
@@ -166,6 +182,24 @@ pub fn install(port: u16) -> Result<(), TridentError> {
     gauge!(HEARTBEAT_TIMESTAMP).set(0.0);
     gauge!(DB_POOL_SIZE).set(0.0);
     gauge!(DB_POOL_IDLE_CONNECTIONS).set(0.0);
+
+    // Histograms render nothing at all until they observe a value — not even
+    // a HELP/TYPE header — so an indexer that has not yet made an RPC call
+    // exports no `trident_indexer_rpc_call_duration_seconds_*` series. Any
+    // alert dividing by `..._count` then evaluates against an empty vector
+    // and silently never fires, which is exactly the class of dead alert the
+    // metric-name check exists to catch. Seeding a zero observation makes the
+    // series exist from the first scrape, matching the counters above.
+    //
+    // The cost is one bucketed sample of 0.0 per histogram, which shifts the
+    // reported minimum but not the alerting ratios these feed.
+    histogram!(POLL_DURATION_SECONDS).record(0.0);
+    histogram!(EVENT_DECODE_DURATION_SECONDS).record(0.0);
+    // Labelled, so seed the methods the poll loop actually calls — the RPC
+    // alerts `sum()` across labels, so the series just has to exist.
+    for method in ["getEvents", "getLedgers"] {
+        histogram!(RPC_CALL_DURATION_SECONDS, "method" => method, "endpoint" => "0").record(0.0);
+    }
 
     tracing::info!(port, "Metrics endpoint listening");
     Ok(())
@@ -220,6 +254,14 @@ pub fn record_events_skipped(count: u64) {
 
 pub fn record_parse_error() {
     counter!(PARSE_ERRORS_TOTAL).increment(1);
+}
+
+pub fn record_dead_lettered() {
+    counter!(DEAD_LETTERED_TOTAL).increment(1);
+}
+
+pub fn record_unhandled_scvariant() {
+    counter!(UNHANDLED_SCVARIANT_TOTAL).increment(1);
 }
 
 pub fn record_poll_duration(seconds: f64) {

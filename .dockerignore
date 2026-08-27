@@ -1,9 +1,33 @@
-# Keep the build context small: docker/docker-compose*.yml build the service
-# images with the repo root as context (Dockerfiles COPY repo-root-relative
-# paths), so without this file every local build ships multi-GB build
-# artifacts to the daemon. CI checkouts are clean, which is why this was
-# never noticed there.
+# Two independent concerns, both load-bearing.
+#
+# 1. Never send local credentials or private key material to a Docker builder.
+#    The runtime images receive secrets only when the platform starts them.
+#
+# 2. Keep the build context small: docker/docker-compose*.yml build the
+#    service images with the repo root as context (Dockerfiles COPY
+#    repo-root-relative paths), so without this file every local build ships
+#    multi-GB build artifacts to the daemon. CI checkouts are clean, which is
+#    why this was never noticed there.
+
+# --- secrets -----------------------------------------------------------------
 .git
+.env
+.env.*
+**/.env
+**/.env.*
+**/*.pem
+**/*.key
+**/*.p12
+**/*.pfx
+**/kubeconfig
+**/kubeconfig.*
+**/*.kubeconfig
+**/.npmrc
+**/.netrc
+**/id_rsa
+**/id_ed25519
+
+# --- build context size ------------------------------------------------------
 target
 **/node_modules
 **/dist

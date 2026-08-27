@@ -107,6 +107,37 @@ paths:
                   - $ref: "#/components/schemas/ReadyResponse"
                   - $ref: "#/components/schemas/ErrorResponse"
 
+  /v1/version:
+    get:
+      summary: Build and schema version
+      description: >-
+        Reports which build is running — semantic version tag, git commit
+        SHA, build timestamp, and the highest applied database migration
+        (issue #397). Answers "which build is live?" during an incident
+        without reading GHCR tags or pod specs.
+
+        Authenticated: the commit SHA and schema version narrow the search
+        for known-vulnerable code paths, so this is not public. Use
+        /v1/ready for an unauthenticated liveness signal.
+
+        When the database is unreachable the endpoint still returns 200 with
+        build metadata and a null schema_version, so it stays usable during
+        exactly the outage you need it for.
+      operationId: getVersion
+      tags:
+        - System
+      responses:
+        "200":
+          description: Build metadata for the running instance
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VersionResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/RateLimitExceeded"
+
   /v1/events:
     get:
       summary: List Soroban contract events
@@ -115,42 +146,35 @@ paths:
       tags:
         - Events
       parameters:
-        - name: contract_id
+        - name: contractId
           in: query
           schema:
             type: string
             pattern: "^C[A-Z2-7]{55}$"
           description: Filter by Soroban contract address (strkey format, 56 chars starting with C)
-          example: CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM
-        - name: topic_0
+          example: CA7QYNF7SOWQ3GLR2BGMZEHXAVIRZA4KVWLTJJFC7MGXUA74P7UJVSGZ
+        - name: topic0
           in: query
           schema:
             type: string
           description: Filter by primary topic (XDR-encoded)
-        - name: topic_1
+        - name: topic1
           in: query
           schema:
             type: string
           description: Filter by secondary topic (XDR-encoded)
-        - name: from_ledger
+        - name: ledgerFrom
           in: query
           schema:
             type: integer
             minimum: 0
           description: Lower bound of ledger range (inclusive)
-        - name: to_ledger
+        - name: ledgerTo
           in: query
           schema:
             type: integer
             minimum: 0
           description: Upper bound of ledger range (inclusive)
-        - name: network
-          in: query
-          schema:
-            type: string
-            enum: [testnet, mainnet]
-            default: testnet
-          description: Network to query
         - name: limit
           in: query
           schema:
@@ -217,6 +241,7 @@ paths:
             application/json:
               schema:
                 type: object
+                additionalProperties: false
                 required:
                   - event
                 properties:
@@ -245,14 +270,14 @@ paths:
       tags:
         - Events
       parameters:
-        - name: contract_id
+        - name: contractId
           in: query
           schema:
             type: string
             pattern: "^C[A-Z2-7]{55}$"
           description: Contract to subscribe to
           required: true
-        - name: topic_0
+        - name: topic0
           in: query
           schema:
             type: string
@@ -270,7 +295,7 @@ paths:
           content:
             text/event-stream:
               schema:
-                type: object
+                type: string
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -336,6 +361,7 @@ paths:
             application/json:
               schema:
                 type: object
+                additionalProperties: false
                 required:
                   - events
                   - missing
@@ -644,17 +670,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                properties:
-                  id:
-                    type: string
-                    format: uuid
-                  key:
-                    type: string
-                    description: The raw API key (shown only once)
-                  key_prefix:
-                    type: string
-                    description: First 16 characters of key for reference
+                $ref: "#/components/schemas/APIKeyResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -677,31 +693,13 @@ paths:
             application/json:
               schema:
                 type: object
+                additionalProperties: false
+                required: [api_keys]
                 properties:
-                  keys:
+                  api_keys:
                     type: array
                     items:
-                      type: object
-                      properties:
-                        id:
-                          type: string
-                          format: uuid
-                        key_prefix:
-                          type: string
-                        label:
-                          type: string
-                        network:
-                          type: string
-                        rate_limit_tier:
-                          type: string
-                        last_used_at:
-                          type: string
-                          format: date-time
-                        request_count:
-                          type: integer
-                        created_at:
-                          type: string
-                          format: date-time
+                      $ref: "#/components/schemas/APIKeyResponse"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "429":
@@ -754,10 +752,41 @@ paths:
             application/json:
               schema:
                 type: object
+                additionalProperties: false
+                required: [pools, stats]
+                properties:
+                  pools:
+                    type: array
+                    items:
+                      type: object
+                      additionalProperties: true
+                  stats:
+                    type: array
+                    items:
+                      type: object
+                      additionalProperties: true
         "401":
           $ref: "#/components/responses/Unauthorized"
         "429":
           $ref: "#/components/responses/TooManyRequestsIPOnly"
+        "502":
+          description: >-
+            The PgBouncer admin console could not be read. It is the upstream
+            here, so a failure to reach it is a bad-gateway condition rather
+            than an error in this service (see handlers/admin.go).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "503":
+          description: >-
+            The endpoint is not configured — ADMIN_API_KEY or
+            PGBOUNCER_ADMIN_URL is unset, so no stats source exists. Deploying
+            without PgBouncer is a supported configuration.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
 
   /metrics:
     get:
@@ -771,7 +800,9 @@ paths:
         "200":
           description: Prometheus metrics
           content:
-            text/plain; version=0.0.4:
+            # Must match what handlers/stats.go actually sets, charset
+            # included — the live contract suite compares the header verbatim.
+            text/plain; version=0.0.4; charset=utf-8:
               schema:
                 type: string
 
@@ -779,6 +810,7 @@ components:
   schemas:
     SorobanEvent:
       type: object
+      additionalProperties: false
       required:
         - id
         - contract_id
@@ -833,9 +865,11 @@ components:
 
     EventListResponse:
       type: object
+      additionalProperties: false
       required:
         - events
         - has_more
+        - next_cursor
       properties:
         events:
           type: array
@@ -852,6 +886,7 @@ components:
 
     LivenessResponse:
       type: object
+      additionalProperties: false
       required:
         - status
       properties:
@@ -862,6 +897,7 @@ components:
 
     ReadyChecks:
       type: object
+      additionalProperties: false
       required:
         - postgres
         - redis
@@ -879,6 +915,7 @@ components:
 
     ReadyResponse:
       type: object
+      additionalProperties: false
       required:
         - status
         - indexer_lag
@@ -898,11 +935,55 @@ components:
         checks:
           $ref: "#/components/schemas/ReadyChecks"
 
+    VersionResponse:
+      type: object
+      required:
+        - version
+        - commit_sha
+        - build_timestamp
+        - schema_version
+      properties:
+        version:
+          type: string
+          description: >-
+            Semantic version tag of the running build, or "dev" for a binary
+            built without release ldflags.
+          example: v1.2.3
+        commit_sha:
+          type: string
+          description: >-
+            Full git commit SHA the binary was built from, or "unknown" when
+            not injected at build time.
+          example: 2e6ad17c8f9b4a1d3e5f7a9c2b4d6e8f0a1c3e5d
+        build_timestamp:
+          type: string
+          description: >-
+            RFC 3339 build time, or "unknown" when not injected at build
+            time. Not typed as date-time because of that sentinel.
+          example: "2026-08-26T15:19:00Z"
+        schema_version:
+          type: string
+          nullable: true
+          description: >-
+            Highest applied migration version from _sqlx_migrations, as a
+            string. Null when no migrations have been applied yet or when
+            Postgres is unreachable — the endpoint still returns 200 in that
+            case so build metadata stays available during an outage.
+
     IndexerStatsResponse:
       type: object
+      additionalProperties: false
       required:
         - status
         - network
+        - last_ledger_indexed
+        - chain_tip_ledger
+        - lag_ledgers
+        - lag_seconds_estimated
+        - events_indexed_total
+        - events_last_poll
+        - avg_poll_duration_ms
+        - last_poll_at
       properties:
         status:
           type: string
@@ -999,6 +1080,7 @@ components:
 
     ContractEventSchemaResponse:
       type: object
+      additionalProperties: false
       required:
         - contract_id
         - network
@@ -1024,6 +1106,7 @@ components:
 
     ContractEventSchema:
       type: object
+      additionalProperties: false
       required:
         - event_name
         - fields
@@ -1039,6 +1122,7 @@ components:
 
     ContractEventFieldSchema:
       type: object
+      additionalProperties: false
       required:
         - name
         - type
@@ -1052,6 +1136,7 @@ components:
 
     ContractSpecResponse:
       type: object
+      additionalProperties: false
       required:
         - contract_id
         - network
@@ -1091,6 +1176,7 @@ components:
 
     ContractSpecFunction:
       type: object
+      additionalProperties: false
       required:
         - name
       properties:
@@ -1100,6 +1186,7 @@ components:
 
     ContractStorageResponse:
       type: object
+      additionalProperties: false
       required:
         - contract_id
         - network
@@ -1121,9 +1208,11 @@ components:
 
     ContractStorageValue:
       type: object
+      additionalProperties: false
       required:
         - storage_key
         - key
+        - value
         - ledger_sequence
         - observed_at
       properties:
@@ -1145,6 +1234,7 @@ components:
 
     ContractStatsResponse:
       type: object
+      additionalProperties: false
       required:
         - contracts
         - from_ledger
@@ -1176,11 +1266,18 @@ components:
 
     ContractStats:
       type: object
+      additionalProperties: false
       required:
         - contract_id
         - event_count
         - last_seen_ledger
         - last_seen_at
+        - invocation_count
+        - total_fee_charged
+        - avg_fee_charged
+        - avg_cpu_instructions
+        - avg_read_bytes
+        - avg_write_bytes
       properties:
         contract_id:
           type: string
@@ -1198,14 +1295,85 @@ components:
           type: string
           format: date-time
           description: Timestamp of last event for this contract
+        invocation_count:
+          type: integer
+          format: int64
+          nullable: true
+        total_fee_charged:
+          type: integer
+          format: int64
+          nullable: true
+        avg_fee_charged:
+          type: number
+          format: double
+          nullable: true
+        avg_cpu_instructions:
+          type: number
+          format: double
+          nullable: true
+        avg_read_bytes:
+          type: number
+          format: double
+          nullable: true
+        avg_write_bytes:
+          type: number
+          format: double
+          nullable: true
+
+    APIKeyResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - key_prefix
+        - label
+        - network
+        - rate_limit_tier
+        - last_used_at
+        - request_count
+        - created_at
+      properties:
+        id:
+          type: string
+          format: uuid
+        key_prefix:
+          type: string
+        key:
+          type: string
+          description: Raw key, returned only at creation time.
+        label:
+          type: string
+        network:
+          type: string
+          enum: [testnet, mainnet]
+        rate_limit_tier:
+          type: string
+        created_by:
+          type: string
+        last_used_at:
+          type: string
+          format: date-time
+          nullable: true
+        request_count:
+          type: integer
+          format: int64
+        revoked_at:
+          type: string
+          format: date-time
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
 
     ErrorResponse:
       type: object
+      additionalProperties: false
       required:
         - error
       properties:
         error:
           type: object
+          additionalProperties: false
           required:
             - code
             - message
@@ -1353,7 +1521,7 @@ components:
     AdminKey:
       type: apiKey
       in: header
-      name: ADMIN_API_KEY
+      name: X-Admin-Key
       description: Admin key for admin endpoints (environment variable)
 
 tags:

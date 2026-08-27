@@ -17,31 +17,31 @@ func newTestLogger() *slog.Logger {
 
 func TestExtractClientIP_XForwardedFor(t *testing.T) {
 	tests := []struct {
-		name     string
-		xff      string
-		realIP   string
-		remote   string
-		want     string
+		name   string
+		xff    string
+		realIP string
+		remote string
+		want   string
 	}{
 		{
-			name:   "single public IP",
-			xff:    "203.0.113.1",
-			want:   "203.0.113.1",
+			name: "single public IP",
+			xff:  "203.0.113.1",
+			want: "203.0.113.1",
 		},
 		{
-			name:   "chain with public IP first",
-			xff:    "203.0.113.1, 10.0.0.1, 192.168.1.1",
-			want:   "203.0.113.1",
+			name: "chain with public IP first",
+			xff:  "203.0.113.1, 10.0.0.1, 192.168.1.1",
+			want: "203.0.113.1",
 		},
 		{
-			name:   "chain with private IPs only returns first",
-			xff:    "10.0.0.1, 192.168.1.1",
-			want:   "10.0.0.1",
+			name: "chain with private IPs only returns first",
+			xff:  "10.0.0.1, 192.168.1.1",
+			want: "10.0.0.1",
 		},
 		{
-			name:   "chain with public IP last",
-			xff:    "10.0.0.1, 203.0.113.1",
-			want:   "203.0.113.1",
+			name: "chain with public IP last",
+			xff:  "10.0.0.1, 203.0.113.1",
+			want: "203.0.113.1",
 		},
 		{
 			name:   "fallback to X-Real-IP",
@@ -59,19 +59,19 @@ func TestExtractClientIP_XForwardedFor(t *testing.T) {
 			want:   "192.0.2.1",
 		},
 		{
-			name:   "IPv6 X-Forwarded-For",
-			xff:    "2001:db8::1, fe80::1",
-			want:   "2001:db8::1",
+			name: "IPv6 X-Forwarded-For",
+			xff:  "2001:db8::1, fe80::1",
+			want: "2001:db8::1",
 		},
 		{
-			name:   "loopback and private — returns first",
-			xff:    "127.0.0.1, 10.0.0.1",
-			want:   "127.0.0.1",
+			name: "loopback and private — returns first",
+			xff:  "127.0.0.1, 10.0.0.1",
+			want: "127.0.0.1",
 		},
 		{
-			name:   "empty with spaces",
-			xff:    "  ,  203.0.113.1  ",
-			want:   "203.0.113.1",
+			name: "empty with spaces",
+			xff:  "  ,  203.0.113.1  ",
+			want: "203.0.113.1",
 		},
 		{
 			name:   "prefer X-Forwarded-For over X-Real-IP",
@@ -141,10 +141,10 @@ func TestAuditWriterCloseFlushes(t *testing.T) {
 		defer close(done)
 		id := uuid.New()
 		aw.Write(AuditEntry{
-			APIKeyID:  &id,
-			Endpoint:  "/v1/events",
-			Method:    "GET",
-			IP:        "203.0.113.1",
+			APIKeyID:   &id,
+			Endpoint:   "/v1/events",
+			Method:     "GET",
+			IP:         "203.0.113.1",
 			StatusCode: 200,
 			DurationMs: 42,
 			RequestID:  "test-req-1",

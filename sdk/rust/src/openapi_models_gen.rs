@@ -16,6 +16,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct OpenApiModels {
+    #[serde(rename = "APIKeyResponse")]
+    pub api_key_response: Option<ApiKeyResponse>,
+
     pub contract_event_field_schema: Option<ContractEventFieldSchema>,
 
     pub contract_event_schema: Option<ContractEventSchema>,
@@ -49,6 +52,43 @@ pub struct OpenApiModels {
     pub soroban_event: Option<SorobanEvent>,
 
     pub token_metadata_response: Option<TokenMetadataResponse>,
+
+    pub version_response: Option<VersionResponse>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiKeyResponse {
+    pub created_at: String,
+
+    pub created_by: Option<String>,
+
+    pub id: String,
+
+    /// Raw key, returned only at creation time.
+    pub key: Option<String>,
+
+    pub key_prefix: String,
+
+    pub label: String,
+
+    pub last_used_at: String,
+
+    pub network: Network,
+
+    pub rate_limit_tier: String,
+
+    pub request_count: i64,
+
+    pub revoked_at: Option<String>,
+}
+
+/// Network queried
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Network {
+    Mainnet,
+
+    Testnet,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -85,15 +125,6 @@ pub struct ContractEventSchemaResponse {
     pub network: Network,
 }
 
-/// Network queried
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Network {
-    Mainnet,
-
-    Testnet,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContractSpecFunction {
     /// Exported function name
@@ -126,17 +157,29 @@ pub struct ContractSpecResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContractStats {
+    pub avg_cpu_instructions: f64,
+
+    pub avg_fee_charged: f64,
+
+    pub avg_read_bytes: f64,
+
+    pub avg_write_bytes: f64,
+
     /// Soroban contract address
     pub contract_id: String,
 
     /// Total events for this contract in range
     pub event_count: i64,
 
+    pub invocation_count: i64,
+
     /// Timestamp of last event for this contract
     pub last_seen_at: String,
 
     /// Latest ledger sequence for this contract
     pub last_seen_ledger: i64,
+
+    pub total_fee_charged: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -213,7 +256,7 @@ pub struct EventListResponse {
     pub has_more: bool,
 
     /// Opaque cursor for next page (null if has_more is false)
-    pub next_cursor: Option<String>,
+    pub next_cursor: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -263,31 +306,31 @@ pub enum EventType {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexerStatsResponse {
     /// Average poll duration in milliseconds
-    pub avg_poll_duration_ms: Option<i64>,
+    pub avg_poll_duration_ms: i64,
 
     /// Current chain tip ledger (from RPC)
-    pub chain_tip_ledger: Option<i64>,
+    pub chain_tip_ledger: i64,
 
     /// Cumulative events indexed
-    pub events_indexed_total: Option<i64>,
+    pub events_indexed_total: i64,
 
     /// Events processed in last poll
-    pub events_last_poll: Option<i64>,
+    pub events_last_poll: i64,
 
     /// Number of ledgers behind chain tip
-    pub lag_ledgers: Option<i64>,
+    pub lag_ledgers: i64,
 
     /// Estimated wall-clock staleness in seconds: lag_ledgers times Stellar's protocol-target
     /// ledger close time (~5s). Null whenever lag_ledgers is null. See
     /// docs/observability/data-freshness.md for the full freshness contract this field is part
     /// of.
-    pub lag_seconds_estimated: Option<f64>,
+    pub lag_seconds_estimated: f64,
 
     /// Latest indexed ledger sequence
-    pub last_ledger_indexed: Option<i64>,
+    pub last_ledger_indexed: i64,
 
     /// Timestamp of last successful poll
-    pub last_poll_at: Option<String>,
+    pub last_poll_at: String,
 
     /// Network name from NETWORK environment variable
     pub network: String,
@@ -378,4 +421,24 @@ pub struct TokenMetadataResponse {
 
     /// Token symbol, from symbol(). Null unless is_token is true.
     pub symbol: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VersionResponse {
+    /// RFC 3339 build time, or "unknown" when not injected at build time. Not typed as date-time
+    /// because of that sentinel.
+    pub build_timestamp: String,
+
+    /// Full git commit SHA the binary was built from, or "unknown" when not injected at build
+    /// time.
+    pub commit_sha: String,
+
+    /// Highest applied migration version from _sqlx_migrations, as a string. Null when no
+    /// migrations have been applied yet or when Postgres is unreachable — the endpoint still
+    /// returns 200 in that case so build metadata stays available during an outage.
+    pub schema_version: String,
+
+    /// Semantic version tag of the running build, or "dev" for a binary built without release
+    /// ldflags.
+    pub version: String,
 }

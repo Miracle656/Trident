@@ -84,3 +84,5 @@ wiremock = "0.6"
 # Database integration tests
 sqlx = { version = "0.7", features = ["postgres", "runtime-tokio-native-tls", "uuid", "chrono", "json", "macros"] }
 metrics-util = { version = "0.20.4", default-features = false, features = ["debugging"] }
+# Property-based testing for XDR parser fuzz coverage (issue #416)
+proptest = "1"

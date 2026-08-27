@@ -5,7 +5,9 @@
 
 global:
   # Name of a pre-existing Secret that holds sensitive env vars.
-  # Required keys: DATABASE_URL, REDIS_URL, ADMIN_API_KEY
+  # Required keys: DATABASE_URL, REDIS_URL, ADMIN_API_KEY, API_KEY_SALT,
+  # STELLAR_RPC_URL. Production values files contain references only; the
+  # values themselves live in the external backend configured below.
   #
   # This name is also the *target* Secret when externalSecret.enabled is
   # true below — the operator writes/syncs into a Secret with this same
@@ -35,7 +37,8 @@ global:
       kind: ClusterSecretStore
     refreshInterval: 1h
     # Maps each key the chart's Secret needs (DATABASE_URL, REDIS_URL,
-    # ADMIN_API_KEY) to its path in the backend. Defaults assume a
+    # ADMIN_API_KEY, API_KEY_SALT, STELLAR_RPC_URL) to its path in the backend.
+    # Defaults assume a
     # single JSON/KV secret at "trident/prod" with matching keys —
     # override remoteRef.key / .property per backend layout.
     data:
@@ -51,6 +54,14 @@ global:
         remoteRef:
           key: trident/prod
           property: ADMIN_API_KEY
+      - secretKey: API_KEY_SALT
+        remoteRef:
+          key: trident/prod
+          property: API_KEY_SALT
+      - secretKey: STELLAR_RPC_URL
+        remoteRef:
+          key: trident/prod
+          property: STELLAR_RPC_URL
 
 # ---------------------------------------------------------------------------
 # Database migrations (issue #308) — runs as a Helm pre-install/pre-upgrade

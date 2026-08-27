@@ -4,17 +4,12 @@ name: Staging Deploy
 # smoke test staging (issue #313). See docs/deployment.md#staging for the
 # full write-up, including what is fully automated here vs. best-effort.
 #
-# IMPORTANT — partially stubbed pending issue #308:
-# The "run migrations" step below is a placeholder. Issue #308 ("database
-# migration job as a Helm hook") is still open/unimplemented — there is no
-# Helm pre-upgrade hook Job in helm/trident/templates yet. Until #308 lands,
-# this workflow runs migrations directly via `sqlx migrate run` against the
-# staging database from the runner (same mechanism CI's `rust` job already
-# uses), which is a reasonable stand-in but is NOT the same thing as an
-# in-cluster, chart-versioned migration hook that runs exactly once per
-# release and blocks the rollout on failure. Replace the "Run database
-# migrations" step with a `helm upgrade --wait` against the real hook once
-# #308 ships.
+# Database migrations run as a Helm pre-upgrade hook Job
+# (helm/trident/templates/migration-job.yaml, implemented in issue #308).
+# The Job is wired with helm.sh/hook: pre-install,pre-upgrade and
+# helm.sh/hook-weight: "-5" to ensure schema changes are applied before any
+# app Deployment (indexer/grpc-api/go-api) rolls out. This workflow's
+# `helm upgrade --install` step below triggers that hook automatically.
 on:
   push:
     branches: [dev]
@@ -48,6 +43,10 @@ jobs:
       - name: Short SHA
         id: sha
         run: echo "short=${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+
+      - name: Build timestamp
+        id: build-time
+        run: echo "timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@68827325e0b33c7199eb31dd4e31fbe9023e06e3 # v3.0.0
@@ -98,13 +97,17 @@ jobs:
           tags: |
             ${{ env.REGISTRY }}/${{ env.ORG }}/trident-go-api:staging
             ${{ env.REGISTRY }}/${{ env.ORG }}/trident-go-api:staging-${{ steps.sha.outputs.short }}
+          build-args: |
+            VERSION=staging-${{ steps.sha.outputs.short }}
+            COMMIT_SHA=${{ github.sha }}
+            BUILD_TIME=${{ steps.build-time.outputs.timestamp }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
   # ---------------------------------------------------------------------------
-  # Detect whether staging deploy credentials are configured. Forked PRs and
-  # repos that haven't provisioned a staging cluster yet get a clean, visibly
-  # skipped run instead of a hard failure on every dev push.
+  # Validate that required staging deploy credentials are configured. Fails
+  # loudly with a clear error message naming each missing secret/variable to
+  # prevent silent deploy skips (issue #395).
   # ---------------------------------------------------------------------------
   check-staging-config:
     name: Check staging secrets are configured
@@ -116,13 +119,27 @@ jobs:
       - id: check
         env:
           HAS_KUBECONFIG: ${{ secrets.STAGING_KUBECONFIG != '' }}
+          HAS_DATABASE_URL: ${{ vars.STAGING_DATABASE_URL != '' }}
         run: |
-          if [ "$HAS_KUBECONFIG" = "true" ]; then
-            echo "configured=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "configured=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::STAGING_KUBECONFIG is not set — skipping deploy+smoke test. See docs/deployment.md#staging."
+          missing_secrets=()
+          
+          if [ "$HAS_KUBECONFIG" != "true" ]; then
+            missing_secrets+=("STAGING_KUBECONFIG")
           fi
+          
+          if [ "$HAS_DATABASE_URL" != "true" ]; then
+            missing_secrets+=("STAGING_DATABASE_URL")
+          fi
+          
+          if [ ${#missing_secrets[@]} -gt 0 ]; then
+            echo "::error::Required staging secrets are missing: ${missing_secrets[*]}"
+            echo "::error::Configure these in GitHub repository settings → Secrets and variables → Actions"
+            echo "::error::See docs/deployment.md#staging for setup instructions"
+            exit 1
+          fi
+          
+          echo "configured=true" >> "$GITHUB_OUTPUT"
+          echo "✓ All required staging secrets are configured"
 
   # ---------------------------------------------------------------------------
   # Deploy to staging via Helm, then run migrations.
@@ -146,9 +163,12 @@ jobs:
           version: "3.14.0"
 
       - name: Configure kubeconfig
+        env:
+          STAGING_KUBECONFIG: ${{ secrets.STAGING_KUBECONFIG }}
         run: |
           mkdir -p "$HOME/.kube"
-          echo "${{ secrets.STAGING_KUBECONFIG }}" | base64 -d > "$HOME/.kube/config"
+          printf '%s' "$STAGING_KUBECONFIG" | base64 -d > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
 
       - name: Helm upgrade --install
         run: |
@@ -162,31 +182,16 @@ jobs:
             --set goApi.image.tag=staging-${{ needs.build-and-push.outputs.sha }} \
             --wait --timeout 5m
 
-      # STUBBED pending issue #308 — see the note at the top of this file.
-      # Runs migrations from the runner directly rather than via an in-cluster
-      # Helm hook. Requires STAGING_DATABASE_URL to be reachable from the
-      # runner (e.g. via a VPN/peering step not modeled here, or a public
-      # staging DB endpoint) — if your staging Postgres isn't runner-reachable,
-      # this step needs a `kubectl run`/Job variant instead.
-      - name: Run database migrations (stand-in for issue #308's Helm hook)
-        if: vars.STAGING_DATABASE_URL != ''
-        env:
-          DATABASE_URL: ${{ vars.STAGING_DATABASE_URL }}
-        run: |
-          cargo install sqlx-cli --no-default-features --features postgres || true
-          sqlx migrate run --source database/migrations
-
   # ---------------------------------------------------------------------------
-  # Post-deploy smoke test against staging: health, a real query, the SSE
-  # stream endpoint, and an error path. Mirrors the shape of the `e2e` job's
-  # assertions in ci.yml (issue #301, closed) but points at the deployed
-  # staging URL instead of a local docker compose stack.
+  # Post-deploy smoke test suite that gates staging rollout (issue #396).
+  # Tests critical endpoints to ensure freshly deployed staging actually serves
+  # traffic before declaring success. A failing smoke test blocks promotion.
   #
-  # A failing smoke test fails this job, which is a required check on the
-  # `environment: staging` deployment above — GitHub Environments can be
-  # configured with protection rules so a failed smoke test blocks promotion
-  # (see docs/deployment.md#staging for wiring that up in repo settings,
-  # which this workflow file cannot itself configure).
+  # Acceptance criteria from #396:
+  # - GET /health
+  # - GET /v1/ready
+  # - GET /v1/events (authenticated)
+  # - GET /v1/stats/indexer
   # ---------------------------------------------------------------------------
   smoke-test-staging:
     name: Smoke test staging
@@ -201,31 +206,62 @@ jobs:
       # a connection accepted and then reset, which is exactly what a rolling
       # deployment produces. An explicit loop retries on any failure, matching
       # the e2e health checks in ci.yml (issue #388).
-      - name: Health check
+      - name: Smoke test - GET /health
         run: |
+          echo "::group::Testing /health endpoint"
           for attempt in $(seq 1 20); do
-            if curl --silent --fail --max-time 10 "${{ vars.STAGING_URL }}/v1/health"; then
-              echo "staging /v1/health returned 200 OK (attempt $attempt)"
+            if curl --silent --fail --max-time 10 "${{ vars.STAGING_URL }}/health"; then
+              echo "✓ /health returned 200 OK (attempt $attempt)"
+              echo "::endgroup::"
               exit 0
             fi
             sleep 5
           done
-          echo "::error::staging /v1/health did not return 200 within 100s"
+          echo "::endgroup::"
+          echo "::error::Smoke test failed: /health did not return 200 within 100s"
           exit 1
 
-      - name: Query path (GET /v1/events)
-        env:
-          STAGING_API_KEY: ${{ secrets.STAGING_API_KEY }}
+      - name: Smoke test - GET /v1/ready
         run: |
-          curl --silent --fail --max-time 10 \
-            -H "X-API-Key: ${STAGING_API_KEY}" \
-            "${{ vars.STAGING_URL }}/v1/events?limit=1" \
-            | python3 -c "import sys,json; json.load(sys.stdin); print('OK: /v1/events returned valid JSON')"
+          echo "::group::Testing /v1/ready endpoint"
+          for attempt in $(seq 1 10); do
+            if curl --silent --fail --max-time 10 "${{ vars.STAGING_URL }}/v1/ready"; then
+              echo "✓ /v1/ready returned 200 OK (attempt $attempt)"
+              echo "::endgroup::"
+              exit 0
+            fi
+            sleep 3
+          done
+          echo "::endgroup::"
+          echo "::error::Smoke test failed: /v1/ready did not return 200 within 30s"
+          exit 1
 
-      - name: Stream path (GET /v1/events/stream, bounded)
+      - name: Smoke test - GET /v1/events (authenticated)
         env:
           STAGING_API_KEY: ${{ secrets.STAGING_API_KEY }}
         run: |
+          echo "::group::Testing authenticated GET /v1/events"
+          response=$(curl --silent --fail --max-time 10 \
+            -H "X-API-Key: ${STAGING_API_KEY}" \
+            "${{ vars.STAGING_URL }}/v1/events?limit=1")
+          
+          echo "$response" | python3 -c "import sys,json; json.load(sys.stdin); print('✓ /v1/events returned valid JSON with authentication')"
+          echo "::endgroup::"
+
+      - name: Smoke test - GET /v1/stats/indexer
+        run: |
+          echo "::group::Testing /v1/stats/indexer endpoint"
+          response=$(curl --silent --fail --max-time 10 \
+            "${{ vars.STAGING_URL }}/v1/stats/indexer")
+          
+          echo "$response" | python3 -c "import sys,json; data=json.load(sys.stdin); print('✓ /v1/stats/indexer returned valid JSON'); print(f'  Indexer stats: {data}')"
+          echo "::endgroup::"
+
+      - name: Additional validation - Stream path (GET /v1/events/stream, bounded)
+        env:
+          STAGING_API_KEY: ${{ secrets.STAGING_API_KEY }}
+        run: |
+          echo "::group::Testing SSE stream endpoint"
           # Bounded read: the SSE stream never closes on its own, so cap wall
           # time and treat "connected and received at least one byte or
           # timed out cleanly" as success — this only proves the stream
@@ -234,18 +270,27 @@ jobs:
           curl --silent --fail --max-time 8 \
             -H "X-API-Key: ${STAGING_API_KEY}" \
             "${{ vars.STAGING_URL }}/v1/events/stream" > /dev/null || \
-            { code=$?; [ "$code" -eq 28 ] && echo "OK: stream connected (bounded timeout reached)" || { echo "FAIL: stream endpoint errored (curl exit $code)"; exit 1; }; }
+            { code=$?; [ "$code" -eq 28 ] && echo "✓ Stream connected (bounded timeout reached)" || { echo "::error::Stream endpoint errored (curl exit $code)"; echo "::endgroup::"; exit 1; }; }
+          echo "::endgroup::"
 
-      - name: Error path (invalid API key -> 401)
+      - name: Additional validation - Error path (invalid API key -> 401)
         run: |
+          echo "::group::Testing authentication rejection"
           status=$(curl --silent -o /dev/null -w '%{http_code}' --max-time 10 \
             -H "X-API-Key: definitely-not-a-valid-key" \
             "${{ vars.STAGING_URL }}/v1/events?limit=1")
           if [ "$status" != "401" ]; then
-            echo "FAIL: expected 401 for an invalid API key, got $status"
+            echo "::error::Expected 401 for invalid API key, got $status"
+            echo "::endgroup::"
             exit 1
           fi
-          echo "OK: invalid API key correctly rejected with 401"
+          echo "✓ Invalid API key correctly rejected with 401"
+          echo "::endgroup::"
+
+      - name: Smoke test summary
+        if: success()
+        run: |
+          echo "::notice::✓ All smoke tests passed - staging deployment is healthy"
 
   # ---------------------------------------------------------------------------
   # Alert on a failed staging deploy/smoke test. Reuses ALERT_WEBHOOK_URL
@@ -255,11 +300,17 @@ jobs:
     name: Alert on staging failure
     runs-on: ubuntu-latest
     needs: [deploy-staging, smoke-test-staging]
-    if: failure() && vars.STAGING_ALERT_WEBHOOK_URL != ''
+    if: failure()
     steps:
       - name: POST failure notification
+        env:
+          STAGING_ALERT_WEBHOOK_URL: ${{ secrets.STAGING_ALERT_WEBHOOK_URL }}
         run: |
+          if [ -z "$STAGING_ALERT_WEBHOOK_URL" ]; then
+            echo "STAGING_ALERT_WEBHOOK_URL is not configured; skipping notification"
+            exit 0
+          fi
           curl --silent --fail --max-time 10 -X POST \
             -H "Content-Type: application/json" \
             -d "{\"text\":\"Trident staging deploy/smoke test failed for ${{ github.sha }} — promotion to main blocked.\"}" \
-            "${{ vars.STAGING_ALERT_WEBHOOK_URL }}"
+            "$STAGING_ALERT_WEBHOOK_URL"

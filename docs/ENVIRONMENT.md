@@ -140,8 +140,138 @@ description is accurate. Keep this file honest by hand.
 |---|---|---|---|
 | `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` | Optional (compose only) | `trident` / `password` / `trident` | Postgres container bootstrap credentials. |
 | `LOG_LEVEL` | Optional | `info` | Go API log verbosity (`.env.ci`/compose convenience; not read directly by Rust services, which use `RUST_LOG`). |
+| `APP_ENV` | Optional | unset | Go API log *format*, not verbosity. `production` emits JSON for log aggregation; anything else (including unset) emits human-readable text. Pair with `LOG_LEVEL`, which controls the threshold. |
+
+## Production secret inventory
+
+This table is the launch inventory for values that are credentials or can
+embed credentials. Non-secret configuration remains in Helm/Fly values; these
+values must live in the platform's managed store and must never be committed,
+passed as Docker build arguments, or printed in logs.
+
+| Secret | Requirement and purpose | Format | Managed source | Rotation owner |
+|---|---|---|---|---|
+| `DATABASE_URL` | Required by every service and migrations; authenticates to PostgreSQL/PgBouncer. | PostgreSQL URI with TLS parameters where supported: `postgres://user:password@host:port/database?...` | External Secrets backend / Fly Postgres secret | Database/SRE owner |
+| `REDIS_URL` | Required by indexer, gRPC API, and Go API; authenticates to Redis. | `redis://` or `rediss://` URI; use `rediss://` outside a private trusted network. | External Secrets backend / Fly secrets | Database/SRE owner |
+| `STELLAR_RPC_URL` / `STELLAR_RPC_URLS` | One is required by the indexer. Treat as secret when the provider URL contains a token. | One HTTPS URL, or a comma-separated ordered list of HTTPS URLs. | External Secrets backend / Fly secrets | Indexer service owner |
+| `ADMIN_API_KEY` | Required for administrative API operations. | At least 32 cryptographically random bytes, encoded as 64 hex characters or base64. | External Secrets backend / Fly secrets | Security owner |
+| `INTERNAL_API_KEY` | Required when `/internal/status` is used. | At least 32 cryptographically random bytes, encoded as hex or base64. | External Secrets backend / Fly secrets | Platform/SRE owner |
+| Raw API keys, including `STAGING_API_KEY` | Authenticate API clients and the staging smoke test. | At least 32 cryptographically random bytes; store only the raw client copy and the server-side HMAC/hash. | DB-backed key issuer; staging copy in GitHub Environment secrets | API service owner |
+| `API_KEY_SALT` | Required in production to HMAC API keys; the built-in development value is forbidden. | 32 random bytes encoded as 64 lowercase hex characters. | External Secrets backend / Fly secrets | Security owner |
+| `API_KEY_HASHES` | Required only for the legacy environment-backed key path. | Comma-separated lowercase 64-character HMAC-SHA256 digests. | External Secrets backend / Fly secrets | API service owner |
+| `PGBOUNCER_ADMIN_URL` | Required only for the admin pool-stat endpoint; carries PgBouncer credentials. | PostgreSQL URI for the PgBouncer admin database. | External Secrets backend / Fly secrets | Database/SRE owner |
+| `ALERT_WEBHOOK_URL` / `STAGING_ALERT_WEBHOOK_URL` | Optional alert destinations; webhook URLs commonly contain bearer tokens. | Provider-issued HTTPS webhook URL. | External Secrets/Fly secrets; GitHub Environment secret for staging | Observability/SRE owner |
+| Credential-bearing `OTEL_EXPORTER_OTLP_ENDPOINT` | Required only when the collector authenticates through its URL. | HTTPS OTLP endpoint; prefer a separate secret header mechanism if supported. | External Secrets backend / Fly secrets | Observability/SRE owner |
+| `INTERNAL_SERVER_KEY` / `INTERNAL_CLIENT_KEY` | Required when internal gRPC mTLS is enabled. | Unencrypted PKCS#8 PEM private keys, readable only by the workload identity. | External Secrets backend or cert-manager-managed Kubernetes Secret | Security/PKI owner |
+| `INTERNAL_CA_CERT`, `INTERNAL_SERVER_CERT`, `INTERNAL_CLIENT_CERT` | Required with internal gRPC mTLS. Certificates are public material but are managed with their private keys. | PEM-encoded X.509 certificate/bundle with SANs matching service DNS names. | External Secrets backend or cert-manager-managed Kubernetes Secret | Security/PKI owner |
+| `STAGING_KUBECONFIG` | Required for the staging deployment workflow. | Base64 of a minimal kubeconfig scoped to the staging namespace. | GitHub `staging` Environment secret | Platform/SRE owner |
+| `NPM_TOKEN` | Required by SDK publishing workflows. | npm automation or granular access token limited to the Trident package scope. | GitHub release Environment secret | Release engineering owner |
+| `GITHUB_TOKEN` | Required for GHCR, releases, and security tooling; issued automatically per job. | GitHub-generated ephemeral token with job-minimal permissions. | GitHub Actions automatic token | Repository administrators |
+
+Helm workloads read secrets only from `global.existingSecret`. Production
+must populate that Secret from the configured `ExternalSecret`/managed
+backend (or a managed CSI provider); committed `values*.yaml` files contain
+only remote key references. Fly applications source the same values through
+`fly secrets`; secret names and values are forbidden in each file's `[env]`
+table. GitHub credentials use repository or Environment secrets, not Actions
+variables. Environment secrets should be preferred so approval and branch
+protection can be applied to staging and release credentials.
+
+## Rotation procedures
+
+All rotations must be recorded in the owning team's audit log. Verify the new
+credential before revoking the old one, and never paste a value into an issue,
+PR, command trace, or CI output.
+
+### Database and Redis credentials
+
+1. Create a new least-privilege database/Redis credential while the old one
+   remains valid.
+2. Update `DATABASE_URL`, `PGBOUNCER_ADMIN_URL`, or `REDIS_URL` in the managed
+   backend (`fly secrets set` for Fly, or the External Secrets provider for
+   Helm). Force an ExternalSecret refresh when waiting for its normal interval
+   is unacceptable.
+3. Restart every consuming workload because services do not hot-reload
+   environment variables. Verify readiness, migrations, event publication,
+   and API reads.
+4. Revoke the old credential and confirm it can no longer connect.
+
+### API and shared authentication keys
+
+- For DB-backed API keys, issue the replacement, update the client, verify it,
+  then revoke the old key. For `API_KEY_HASHES`, temporarily include both old
+  and new digests, migrate clients, then remove the old digest.
+- `ADMIN_API_KEY` and `INTERNAL_API_KEY` currently accept one value. Schedule a
+  coordinated cutover: distribute the replacement through the consumers'
+  managed stores, update the server store and restart, verify, then destroy the
+  old value. Never send either key through chat or deployment logs.
+- Rotating `API_KEY_SALT` invalidates every legacy `API_KEY_HASHES` digest and
+  changes rate-limit/cache identities; DB-backed SHA-256 keys still
+  authenticate. Generate the new legacy digests from securely held raw keys,
+  or reissue those keys if the raw values are unavailable, then update the salt
+  and digest list together. Expect rate-limit counters/caches to start fresh.
+
+### Stellar RPC, alert webhook, and telemetry credentials
+
+Create a replacement token/URL at the provider, update the managed store,
+restart the consuming service or rerun the workflow, and verify one successful
+RPC/export/notification before revoking the old endpoint credential. If the
+provider cannot overlap credentials, use a planned cutover window.
+
+### Internal mTLS certificates and keys
+
+Issue a new CA/leaf set before expiry. For a CA rotation, first deploy a bundle
+containing both old and new CAs, then rotate server and client leaf
+certificates, verify mutual authentication, and finally remove the old CA and
+private keys. Update the external backend/cert-manager Secret and restart both
+the Go and gRPC API deployments after each phase.
+
+### GitHub Actions credentials
+
+- Rotate `STAGING_API_KEY` through the API-key overlap procedure, then replace
+  the GitHub Environment secret. Replace `STAGING_KUBECONFIG` by issuing a new
+  namespace-scoped identity, test a staging deploy, and revoke the old identity.
+- Replace `STAGING_DATABASE_URL` and `STAGING_ALERT_WEBHOOK_URL` using their
+  respective class procedure above.
+- Create a new least-privilege `NPM_TOKEN`, replace the release Environment
+  secret, publish/verify a test or next release, then revoke the old token.
+- `GITHUB_TOKEN` is ephemeral and rotates automatically for every job; review
+  workflow `permissions` whenever its use changes.
+
+## Audit controls
+
+- `.github/workflows/secrets-scan.yml` checks out with `fetch-depth: 0` and
+  runs `gitleaks detect`, scanning the complete repository history rather than
+  only the pull-request diff. The 2026-08-26 launch audit scanned all 280
+  commits and found no leaks.
+- `.gitleaks.toml` contains the only false-positive documentation: fixed,
+  publicly-known `.env.ci` test credentials, allowlisted by both value and
+  path. Production-shaped findings must never be allowlisted.
+- `.dockerignore` prevents local environment files and private key material
+  from entering any build context. The security workflow builds all four
+  shipped images and runs `scripts/check-image-history.sh`; the check inspects
+  untruncated layer commands and final image Env/Labels without printing a
+  matching layer that could contain a secret.
+- GitHub workflow secrets are passed through masked step environments, never
+  interpolated directly into shell source. Service connection errors pass
+  through `redactConnErr`, and the Go tests cover connection-URL and raw API-key
+  log redaction. The launch source audit found no log statement that emits a
+  secret-bearing environment value.
 
 ## CI-only
+
+### Live OpenAPI contract suite
+
+`services/api/internal/contracttest` validates a running API's responses
+against `api/openapi.yaml`. It is skipped unless `CONTRACTTEST_BASE_URL` is
+set, so these are read only by the `e2e` job — never by a running service.
+
+| Variable | Required | Description |
+|---|---|---|
+| `CONTRACTTEST_BASE_URL` | Yes, to run the suite | Base URL of the API under test. Unset skips the whole suite. |
+| `CONTRACTTEST_API_KEY` | Yes, when the suite runs | Key for authenticated endpoints. |
+| `CONTRACTTEST_ADMIN_KEY` | Yes, when the suite runs | Key for the `/v1/admin/*` endpoints. |
+| `CONTRACTTEST_REDIS_URL` | Yes, when the suite runs | Redis used to seed stream fixtures before asserting on `/v1/events/stream`. |
 
 `.env.ci` additionally pins a fixed, publicly-known test API key/salt/hash —
 documented inline in that file as "do not use outside CI".
