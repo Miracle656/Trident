@@ -55,6 +55,9 @@ pub const EVENTS_BY_CONTRACT_TOTAL: &str = "trident_indexer_events_by_contract_t
 pub const EVENT_DECODE_DURATION_SECONDS: &str = "trident_indexer_event_decode_duration_seconds";
 /// Health score (0-100) for each RPC endpoint. Label: `endpoint` (URL).
 pub const RPC_HEALTH_SCORE: &str = "trident_rpc_health_score";
+pub const RPC_CIRCUIT_STATE: &str = "trident_rpc_circuit_state";
+pub const REORGS_TOTAL: &str = "trident_indexer_reorgs_total";
+pub const LEDGER_GAPS_TOTAL: &str = "trident_indexer_ledger_gaps_total";
 /// Indexer's own Postgres pool, documented in docs/metrics-catalog.md.
 pub const DB_POOL_SIZE: &str = "trident_indexer_db_pool_size";
 pub const DB_POOL_IDLE_CONNECTIONS: &str = "trident_indexer_db_pool_idle_connections";
@@ -145,6 +148,18 @@ pub fn install(port: u16) -> Result<(), TridentError> {
     describe_gauge!(
         RPC_HEALTH_SCORE,
         "Health score (0-100) for each RPC endpoint (multi-RPC failover)"
+    );
+    describe_gauge!(
+        RPC_CIRCUIT_STATE,
+        "Circuit breaker state per endpoint: 0=closed, 1=open, 2=half-open"
+    );
+    describe_counter!(
+        REORGS_TOTAL,
+        "Ledger reorganizations detected (fork detected and cursor rewound)"
+    );
+    describe_gauge!(
+        LEDGER_GAPS_TOTAL,
+        "Number of missing ledger sequences detected in the processed range"
     );
 
     // Counters only render in the scrape output once touched at least once;
@@ -302,4 +317,26 @@ pub fn record_decode_duration(seconds: f64) {
 /// which endpoints are degraded and whether failover is working.
 pub fn set_rpc_health_score(endpoint: &str, score: u8) {
     gauge!(RPC_HEALTH_SCORE, "endpoint" => endpoint.to_string()).set(score as f64);
+}
+
+/// Publish the circuit breaker state for an endpoint as a numeric gauge:
+/// 0 = Closed, 1 = Open, 2 = HalfOpen.
+pub fn set_rpc_circuit_state(endpoint: &str, state: &str) {
+    let val = match state {
+        "Closed" => 0.0,
+        "Open" => 1.0,
+        "HalfOpen" => 2.0,
+        _ => 0.0,
+    };
+    gauge!(RPC_CIRCUIT_STATE, "endpoint" => endpoint.to_string()).set(val);
+}
+
+/// Count a detected ledger reorganization.
+pub fn record_reorg() {
+    counter!(REORGS_TOTAL).increment(1);
+}
+
+/// Publish the current number of detected ledger gaps.
+pub fn set_ledger_gaps(count: i64) {
+    gauge!(LEDGER_GAPS_TOTAL).set(count as f64);
 }

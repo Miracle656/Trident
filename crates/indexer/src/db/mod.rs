@@ -674,6 +674,102 @@ pub async fn get_cursor(pool: &PgPool) -> Result<u64, TridentError> {
         .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("cursor parse")))
 }
 
+/// Check whether the given ledger hash matches the stored hash for `sequence`.
+///
+/// Returns `Ok(true)` if the hashes match (or no stored hash exists),
+/// `Ok(false)` if a reorg is detected (hash mismatch), or an error on DB failure.
+pub async fn check_ledger_reorg(
+    pool: &PgPool,
+    sequence: u64,
+    new_hash: &str,
+) -> Result<bool, TridentError> {
+    if new_hash.is_empty() {
+        return Ok(true); // no hash to compare
+    }
+    let row: Option<(String,)> = sqlx::query_as(
+        "SELECT ledger_hash FROM ledger_metadata WHERE ledger_sequence = $1",
+    )
+    .bind(sequence as i64)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("check_ledger_reorg")))?;
+
+    match row {
+        Some((stored_hash,)) if !stored_hash.is_empty() && stored_hash != new_hash => Ok(false),
+        _ => Ok(true),
+    }
+}
+
+/// Rewind the cursor to `target` and delete all ledger metadata and events
+/// at sequences > `target`. Used to undo a reorg.
+pub async fn rewind_cursor(pool: &PgPool, target: u64) -> Result<(), TridentError> {
+    let mut tx = pool.begin().await.map_err(|e| {
+        TridentError::storage(anyhow::Error::new(e).context("rewind_cursor begin"))
+    })?;
+
+    sqlx::query("DELETE FROM ledger_metadata WHERE ledger_sequence > $1")
+        .bind(target as i64)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            TridentError::storage(anyhow::Error::new(e).context("rewind_cursor delete_metadata"))
+        })?;
+
+    sqlx::query("DELETE FROM events WHERE ledger_sequence > $1")
+        .bind(target as i64)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            TridentError::storage(anyhow::Error::new(e).context("rewind_cursor delete_events"))
+        })?;
+
+    sqlx::query(
+        "UPDATE system_state SET value = $1, updated_at = NOW() WHERE key = 'latest_ledger_cursor'",
+    )
+    .bind(target.to_string())
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| {
+        TridentError::storage(anyhow::Error::new(e).context("rewind_cursor set_cursor"))
+    })?;
+
+    tx.commit().await.map_err(|e| {
+        TridentError::storage(anyhow::Error::new(e).context("rewind_cursor commit"))
+    })?;
+
+    Ok(())
+}
+
+/// Detect gaps (missing sequences) in the processed ledger range.
+///
+/// Returns a list of missing sequence numbers. The scan is bounded to
+/// sequences between `from` (inclusive) and `to` (inclusive).
+pub async fn detect_ledger_gaps(
+    pool: &PgPool,
+    from: u64,
+    to: u64,
+) -> Result<Vec<u64>, TridentError> {
+    if from >= to {
+        return Ok(vec![]);
+    }
+    let rows: Vec<(i64,)> = sqlx::query_as(
+        r#"
+        SELECT generate_series($1::bigint, $2::bigint) AS seq
+        EXCEPT
+        SELECT ledger_sequence FROM ledger_metadata
+        WHERE ledger_sequence >= $1 AND ledger_sequence <= $2
+        ORDER BY seq
+        "#,
+    )
+    .bind(from as i64)
+    .bind(to as i64)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("detect_ledger_gaps")))?;
+
+    Ok(rows.into_iter().map(|(s,)| s as u64).collect())
+}
+
 /// Write indexer health metrics into the `system_state` health columns after
 /// every successful poll cycle (issue #62).
 ///
