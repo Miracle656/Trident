@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/Depo-dev/trident/services/api/cursor"
 	"github.com/Depo-dev/trident/services/api/middleware"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -43,8 +44,13 @@ type CreateContractRequest struct {
 }
 
 // ListContractsResponse is the response for GET /v1/admin/contracts.
+//
+// Follows the unified pagination envelope from issue #423 (documented in
+// docs/pagination.md): HasMore is always present, and NextCursor is a
+// non-nil opaque, integrity-checked cursor iff HasMore is true.
 type ListContractsResponse struct {
 	Contracts  []ContractResponse `json:"contracts"`
+	HasMore    bool               `json:"has_more"`
 	NextCursor *string            `json:"next_cursor,omitempty"`
 }
 
@@ -136,21 +142,34 @@ func ListContracts(cfg ContractConfig) http.HandlerFunc {
 			}
 		}
 
-		cursor := r.URL.Query().Get("cursor")
+		// Decode the opaque, integrity-checked cursor into the raw keyset
+		// token (the last-seen id) it wraps (issue #423). An empty cursor
+		// means "first page"; a malformed/tampered one is rejected with 400
+		// rather than silently treated as "first page" or as some other row.
+		var cursorID *string
+		if raw := r.URL.Query().Get("cursor"); raw != "" {
+			tok, err := cursor.Decode(raw)
+			if err != nil {
+				writeJSON(w, http.StatusBadRequest, errorBody("invalid cursor"))
+				return
+			}
+			cursorID = &tok
+		}
 
 		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 		defer cancel()
 
+		// Keyset pagination on the primary-key id column (issue #423):
+		// "id > last-seen-id, ordered by id ASC" never re-shows or skips a
+		// row relative to the cursor's key ordering, even when rows are
+		// inserted concurrently — unlike offset pagination, a new row
+		// inserted before the cursor position does not shift subsequent
+		// rows out from under an in-flight page walk. See docs/pagination.md.
 		query := `SELECT id, contract_id, network, label, index_from, created_at
 				  FROM indexed_contracts
 				  WHERE ($1::uuid IS NULL OR id > $1::uuid)
 				  ORDER BY id ASC
 				  LIMIT $2`
-
-		var cursorID *string
-		if cursor != "" {
-			cursorID = &cursor
-		}
 
 		rows, err := cfg.DB.Query(ctx, query, cursorID, limit+1)
 		if err != nil {
@@ -171,14 +190,17 @@ func ListContracts(cfg ContractConfig) http.HandlerFunc {
 			contracts = append(contracts, c)
 		}
 
+		hasMore := len(contracts) > limit
 		var nextCursor *string
-		if len(contracts) > limit {
-			nextCursor = &contracts[limit-1].ID
+		if hasMore {
+			encoded := cursor.Encode(contracts[limit-1].ID)
+			nextCursor = &encoded
 			contracts = contracts[:limit]
 		}
 
 		writeJSON(w, http.StatusOK, ListContractsResponse{
 			Contracts:  contracts,
+			HasMore:    hasMore,
 			NextCursor: nextCursor,
 		})
 	}
