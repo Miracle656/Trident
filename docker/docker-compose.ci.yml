@@ -61,6 +61,19 @@ services:
   pgbouncer:
     profiles:
       - pgbouncer  # only started when this profile is explicitly selected
+    environment:
+      # CI only: the admin console (the virtual `pgbouncer` database behind
+      # GET /v1/admin/db) cannot authenticate under scram-sha-256 on
+      # PgBouncer 1.15 — even with auth_query resolving the user, SCRAM
+      # verification against the console fails, which is why that endpoint
+      # has never returned 200 in CI. md5 works and is adequate here: the
+      # credential is the publicly-documented `.env.ci` fixture password on a
+      # container-network-only port.
+      #
+      # The base compose keeps scram-sha-256 for real deployments. Fold this
+      # override away once PgBouncer is upgraded past 1.15 (see the pin note
+      # in docker-compose.yml) and confirm the endpoint still answers 200.
+      PGBOUNCER_AUTH_TYPE: md5
 
   # ---------------------------------------------------------------------------
   # Rust gRPC API — added here because it is not in the base compose.
