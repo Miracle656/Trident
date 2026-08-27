@@ -324,24 +324,34 @@ impl Streamer {
                             // Adopt the floor the error reports so the next poll
                             // starts inside the retained window.
                             match parse_retained_floor(&e.to_string()) {
-                                Some(floor) if cursor < floor.saturating_sub(1) => {
+                                Some((floor, ceiling)) if cursor < floor.saturating_sub(1) => {
                                     // page_request_params sends `cursor + 1`. Do
                                     // NOT anchor exactly at the floor: the floor
-                                    // advances by a few ledgers while the loop
-                                    // sleeps between polls, so an exact anchor
-                                    // is rejected again next cycle and the
-                                    // streamer chases the retention edge forever
-                                    // without ingesting anything. Land a margin
-                                    // inside the window instead — ledgers at the
-                                    // very edge are being pruned as we speak, so
-                                    // they are lost either way.
-                                    const RETAINED_FLOOR_MARGIN: u64 = 60;
-                                    cursor = floor
-                                        .saturating_sub(1)
-                                        .saturating_add(RETAINED_FLOOR_MARGIN);
+                                    // advances while the loop sleeps between
+                                    // polls, so an exact anchor is rejected again
+                                    // next cycle and the streamer chases the
+                                    // retention edge forever without ingesting
+                                    // anything.
+                                    //
+                                    // The margin must scale with the window, not
+                                    // be a flat constant. A public network
+                                    // retains ~120k ledgers, where skipping 60 is
+                                    // nothing; a fresh CI chain has a few hundred
+                                    // total, where skipping 60 discards most of
+                                    // the history — including, in the E2E suite,
+                                    // the mint event the test then waits for.
+                                    // 1% of the window bounded to [1, 60] stays
+                                    // clear of the pruning edge on a live network
+                                    // while giving up almost nothing on a short
+                                    // chain.
+                                    let window = ceiling.saturating_sub(floor);
+                                    let margin = (window / 100).clamp(1, 60);
+                                    cursor = floor.saturating_sub(1).saturating_add(margin);
                                     tracing::warn!(
                                         error = %e,
                                         retained_floor = floor,
+                                        retained_ceiling = ceiling,
+                                        margin,
                                         cursor,
                                         "startLedger predates the RPC's retained history; advancing to the oldest retained ledger"
                                     );
@@ -1054,7 +1064,7 @@ fn page_request_params(cursor: u64, page_cursor: Option<&str>) -> (Option<u64>, 
 /// Matching is deliberately narrow: both the `ledger range` phrase and a
 /// `<low> - <high>` pair must be present, so an unrelated RPC error can never
 /// be mistaken for a retention signal and silently move the cursor.
-fn parse_retained_floor(message: &str) -> Option<u64> {
+fn parse_retained_floor(message: &str) -> Option<(u64, u64)> {
     let lower = message.to_lowercase();
     if !lower.contains("ledger range") {
         return None;
@@ -1072,7 +1082,7 @@ fn parse_retained_floor(message: &str) -> Option<u64> {
     let high: u64 = high.parse().ok()?;
     // A well-formed range only; anything inverted means the message shape
     // changed and the value should not be trusted.
-    (low <= high).then_some(low)
+    (low <= high).then_some((low, high))
 }
 
 #[cfg(test)]
@@ -1139,7 +1149,7 @@ mod tests {
             parse_retained_floor(
                 "getEvents: RPC error -32600: startLedger must be within the ledger range: 7 - 457"
             ),
-            Some(7)
+            Some((7, 457))
         );
     }
 
@@ -1168,14 +1178,50 @@ mod tests {
         );
     }
 
+    /// Mirrors the margin arithmetic in the Retryable recovery arm.
+    fn recovery_cursor(floor: u64, ceiling: u64) -> u64 {
+        let window = ceiling.saturating_sub(floor);
+        let margin = (window / 100).clamp(1, 60);
+        floor.saturating_sub(1).saturating_add(margin)
+    }
+
     #[test]
-    fn retained_floor_maps_to_a_cursor_that_anchors_on_the_floor() {
-        // The recovery stores floor - 1 because page_request_params sends
-        // cursor + 1; the next request must land exactly on the floor, not
-        // one past it (which would skip the oldest retained ledger).
-        let floor =
-            parse_retained_floor("startLedger must be within the ledger range: 7 - 457").unwrap();
-        assert_eq!(page_request_params(floor - 1, None), (Some(7), None));
+    fn retained_floor_recovery_stays_inside_a_short_ci_chain() {
+        // Regression for the E2E contract-events failure: against a fresh CI
+        // chain retaining 7-475, a flat 60-ledger margin jumped the cursor to
+        // 66 and skipped the ledger holding the mint event the test then
+        // waited 60s for. The margin must scale with the window.
+        let (floor, ceiling) =
+            parse_retained_floor("startLedger must be within the ledger range: 7 - 475").unwrap();
+        let cursor = recovery_cursor(floor, ceiling);
+        assert_eq!(
+            cursor, 10,
+            "expected a small margin on a ~470-ledger window"
+        );
+        let (start, _) = page_request_params(cursor, None);
+        assert!(
+            start.unwrap() <= 20,
+            "recovery must not skip most of a short chain, got {start:?}"
+        );
+    }
+
+    #[test]
+    fn retained_floor_recovery_clears_the_edge_on_a_long_chain() {
+        // On a public network the window is ~120k ledgers, where anchoring at
+        // the floor loses to pruning between polls. The margin caps at 60.
+        let (floor, ceiling) =
+            parse_retained_floor("startLedger must be within the ledger range: 1000000 - 1120000")
+                .unwrap();
+        assert_eq!(recovery_cursor(floor, ceiling), 1_000_000 - 1 + 60);
+    }
+
+    #[test]
+    fn retained_floor_recovery_never_returns_a_zero_margin() {
+        // A degenerate window must still move off the floor, or the streamer
+        // chases the retention edge forever.
+        let (floor, ceiling) =
+            parse_retained_floor("startLedger must be within the ledger range: 7 - 7").unwrap();
+        assert_eq!(recovery_cursor(floor, ceiling), 7);
     }
 
     fn sym_xdr(s: &str) -> String {
