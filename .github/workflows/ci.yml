@@ -123,6 +123,36 @@ jobs:
       run:
         working-directory: services/api
 
+    # The Go integration tests (pagination cursors, SSE Last-Event-ID resume,
+    # stats/usage rollups) are gated on TEST_DATABASE_URL / TEST_REDIS_URL and
+    # t.Skip() when they are unset. This job previously declared no services,
+    # so every one of them skipped while the job still reported green --
+    # issues #423 and #428 shipped their integration coverage into a job that
+    # never ran it. REQUIRE_TEST_SERVICES below turns a missing service back
+    # into a hard failure so this cannot silently regress again.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: trident
+          POSTGRES_DB: trident_test
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+      redis:
+        image: redis:7-alpine
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+
     steps:
       - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
 
@@ -135,7 +165,25 @@ jobs:
       - name: go vet
         run: go vet ./...
 
+      # Same migration chain the rust and integration jobs apply, so the
+      # DB-backed Go tests run against the real schema rather than a mirror.
+      - name: Apply database migrations
+        working-directory: .
+        env:
+          PGPASSWORD: trident
+        run: |
+          set -euo pipefail
+          for f in database/migrations/*.sql; do
+            echo "Applying $f"
+            psql -v ON_ERROR_STOP=1 -h localhost -U postgres -d trident_test -f "$f"
+          done
+
       - name: go test (race)
+        env:
+          TEST_DATABASE_URL: postgres://postgres:trident@localhost:5432/trident_test
+          TEST_REDIS_URL: redis://localhost:6379
+          REQUIRE_TEST_SERVICES: "1"
+          CI: "true"
         run: go test -race ./...
 
       - name: REST handler coverage

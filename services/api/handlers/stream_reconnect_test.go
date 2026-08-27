@@ -31,6 +31,13 @@ func mustTestRedis(t *testing.T) *redis.Client {
 
 	redisURL := os.Getenv("TEST_REDIS_URL")
 	if redisURL == "" {
+		// A skip here is only legitimate on a developer machine with no
+		// Redis. In CI the service is declared, so an unset URL means the
+		// job is misconfigured -- fail loudly rather than reporting green
+		// on tests that never ran (issue #428's coverage skipped this way).
+		if os.Getenv("REQUIRE_TEST_SERVICES") != "" {
+			t.Fatal("TEST_REDIS_URL must be set when REQUIRE_TEST_SERVICES is set")
+		}
 		t.Skip("TEST_REDIS_URL is not set")
 	}
 	opts, err := redis.ParseURL(redisURL)
