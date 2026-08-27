@@ -65,6 +65,7 @@ resolver are still expressed with the codes below.
 | `UNAUTHORIZED` | 401 | No | The request is missing a valid API key or credential. |
 | `FORBIDDEN` | 403 | No | The request was rejected outright by abuse-protection (e.g. the global concurrency cap shedding load under `#318`), not a normal auth failure. |
 | `NOT_FOUND` | 404 | No | The requested resource does not exist. |
+| `CONFLICT` | 409 | No | The request conflicts with existing state — currently, an `Idempotency-Key` replayed with a different request body (`#426`). Do not retry as-is: either resend the original body to get the cached response, or use a fresh key. |
 | `PAYLOAD_TOO_LARGE` | 413 | No | The request body exceeds the configured `http.MaxBytesReader` limit (`#317`). |
 | `RATE_LIMITED` | 429 | Yes | The caller has exceeded its rate-limit tier. Retry after the window resets — honor `Retry-After` and `X-RateLimit-Reset` rather than retrying immediately. |
 | `INTERNAL` | 500 | Sometimes | An unexpected server-side fault. Not guaranteed to succeed on retry; safe to retry idempotent (GET) requests with backoff, but do not blindly retry writes. |

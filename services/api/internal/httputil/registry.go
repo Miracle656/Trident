@@ -43,6 +43,12 @@ var Registry = []CodeMeta{
 		Summary:    "The requested resource does not exist.",
 	},
 	{
+		Code:       CONFLICT,
+		HTTPStatus: 409,
+		Retryable:  false,
+		Summary:    "The request conflicts with existing state — e.g. an Idempotency-Key replayed with a different request body. Do not retry as-is; either reuse the original body or use a fresh key.",
+	},
+	{
 		Code:       PAYLOAD_TOO_LARGE,
 		HTTPStatus: 413,
 		Retryable:  false,

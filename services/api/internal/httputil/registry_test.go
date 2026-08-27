@@ -6,33 +6,77 @@ import (
 	"go/token"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/Depo-dev/trident/services/api/internal/httputil"
 )
 
-// allDeclaredCodes lists every ErrorCode constant declared in errors.go. Kept
-// as an explicit list (rather than reflection, which can't enumerate untyped
-// consts) so this test fails loudly if a new constant is added without a
-// matching Registry entry.
-var allDeclaredCodes = []httputil.ErrorCode{
-	httputil.NOT_FOUND,
-	httputil.UNAUTHORIZED,
-	httputil.RATE_LIMITED,
-	httputil.INVALID_ARGUMENT,
-	httputil.UNAVAILABLE,
-	httputil.INTERNAL,
-	httputil.PAYLOAD_TOO_LARGE,
-	httputil.FORBIDDEN,
+// declaredCodes parses errors.go and returns the value of every ErrorCode
+// constant declared in it.
+//
+// This is deliberately derived from the source rather than hand-listed.
+// A hand-maintained list only fails when someone remembers to append to it,
+// which is exactly the case where they'd also have remembered the Registry
+// entry. CONFLICT was added to errors.go without either, and the resulting
+// gap made writeError silently downgrade every 409 to INTERNAL while this
+// test still passed. Parsing the declarations means the list cannot drift.
+func declaredCodes(t *testing.T) []httputil.ErrorCode {
+	t.Helper()
+
+	path := filepath.Join(findAPIRoot(t), "internal", "httputil", "errors.go")
+	file, err := parser.ParseFile(token.NewFileSet(), path, nil, 0)
+	if err != nil {
+		t.Fatalf("parsing %s: %v", path, err)
+	}
+
+	var codes []httputil.ErrorCode
+	for _, decl := range file.Decls {
+		gen, ok := decl.(*ast.GenDecl)
+		if !ok || gen.Tok != token.CONST {
+			continue
+		}
+		for _, spec := range gen.Specs {
+			vs, ok := spec.(*ast.ValueSpec)
+			if !ok {
+				continue
+			}
+			// Only consts explicitly typed as ErrorCode. An untyped or
+			// differently-typed const in the same block is not part of
+			// the catalogue.
+			ident, ok := vs.Type.(*ast.Ident)
+			if !ok || ident.Name != "ErrorCode" {
+				continue
+			}
+			for _, v := range vs.Values {
+				lit, ok := v.(*ast.BasicLit)
+				if !ok || lit.Kind != token.STRING {
+					continue
+				}
+				value, err := strconv.Unquote(lit.Value)
+				if err != nil {
+					t.Fatalf("unquoting %s: %v", lit.Value, err)
+				}
+				codes = append(codes, httputil.ErrorCode(value))
+			}
+		}
+	}
+
+	if len(codes) == 0 {
+		t.Fatalf("parsed no ErrorCode constants from %s; the parser is broken, "+
+			"which would make this whole test vacuous", path)
+	}
+	return codes
 }
 
 // TestRegistryCoversAllConstants ensures every ErrorCode constant is
 // documented in httputil.Registry (and thus in docs/errors.md), and that the
 // registry declares nothing extra.
 func TestRegistryCoversAllConstants(t *testing.T) {
-	declared := make(map[httputil.ErrorCode]bool, len(allDeclaredCodes))
-	for _, c := range allDeclaredCodes {
+	all := declaredCodes(t)
+	declared := make(map[httputil.ErrorCode]bool, len(all))
+	for _, c := range all {
 		declared[c] = true
 		if !httputil.IsRegistered(c) {
 			t.Errorf("constant %q has no Registry entry in registry.go", c)
