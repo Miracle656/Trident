@@ -1,0 +1,64 @@
+---
+title: "Idempotency Keys"
+description: "Safely retry resource-creating POST requests with the Idempotency-Key header."
+---
+
+SDKs retry requests on network blips and timeouts. Without idempotency support, retrying a `POST` that actually reached the server can create a duplicate resource — a second API key, a second webhook subscription, and so on.
+
+Send an `Idempotency-Key` header on a resource-creating `POST` and a retry with the same key returns the original response instead of creating anything new.
+
+---
+
+## Supported endpoints
+
+| Method | Path                     | Resource            |
+|--------|--------------------------|----------------------|
+| POST   | `/v1/api-keys`           | API key              |
+| POST   | `/v1/webhooks`           | Webhook subscription |
+| POST   | `/v1/admin/contracts`    | Contract registration|
+
+Idempotency is optional on all of them — a request without the header behaves exactly as before.
+
+---
+
+## Usage
+
+Generate a unique key per logical operation (a UUID works well) and send it on every attempt of that operation, including retries:
+
+```http
+POST /v1/api-keys
+X-Admin-Key: ...
+Idempotency-Key: 6c2f6b8e-6a3b-4e6a-9b8b-2b7b9b7b6a1a
+Content-Type: application/json
+
+{"label": "prod-key", "network": "mainnet"}
+```
+
+- **First request**: runs normally and the response is cached against the key.
+- **Retry with the same key and the same body**: the cached response is replayed verbatim (same status code and body) and no new resource is created. The response carries `Idempotency-Replayed: true`.
+- **Retry with the same key and a *different* body**: this indicates the key was reused across two different logical requests (a client bug, not a retry), so the API rejects it with `409 Conflict`:
+
+```json
+{
+  "error": {
+    "code": "CONFLICT",
+    "message": "Idempotency-Key was already used with a different request body"
+  }
+}
+```
+
+- **A request that fails with a `5xx`** is not cached, so retrying with the same key after a genuine server error can still succeed.
+
+---
+
+## Retention
+
+Idempotency records are stored in Redis for **24 hours** from the original request and expire automatically (native Redis TTL — no separate cleanup job is required). After the window elapses, a repeated key is treated as a brand-new request.
+
+If Redis is unavailable, idempotency checking fails open: the request still runs normally rather than being rejected. This trades strict duplicate-prevention for availability during a Redis outage, matching this API's other Redis-backed middleware (e.g. rate limiting).
+
+---
+
+## SDK support
+
+The Go SDK does not yet attach `Idempotency-Key` automatically on retried POST requests — tracked as a follow-up. Until then, callers using any SDK that retries POST requests should set the header themselves on operations they care about deduplicating.

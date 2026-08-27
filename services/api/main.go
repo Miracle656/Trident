@@ -279,6 +279,14 @@ func main() {
 	// Configure internal status handler with dependencies.
 	handlers.SetInternalStatusDeps(pool, redisClient, hub)
 
+	// Idempotency-Key support for resource-creating POST endpoints (issue
+	// #426, closes #225): a client retry that resends the same
+	// Idempotency-Key gets back the original response instead of creating a
+	// second resource. Optional — requests without the header are
+	// unaffected. Backed by Redis, the same client used for rate limiting
+	// and cache invalidation elsewhere in this file.
+	idempotency := middleware.Idempotency(middleware.IdempotencyConfig{Redis: redisClient})
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/health", handlers.Health())
 	mux.HandleFunc("GET /v1/ready", handlers.Ready(healthDB, redisClient, grpcClient))
@@ -291,11 +299,11 @@ func main() {
 	mux.HandleFunc("GET /v1/admin/keys/{id}/usage", handlers.AdminKeyUsage(adminCfg))
 	// Admin contract registration CRUD (issue #230)
 	contractCfg := handlers.ContractConfig{AdminKey: os.Getenv("ADMIN_API_KEY"), DB: pool}
-	mux.HandleFunc("POST /v1/admin/contracts", handlers.CreateContract(contractCfg))
+	mux.Handle("POST /v1/admin/contracts", idempotency(handlers.CreateContract(contractCfg)))
 	mux.HandleFunc("GET /v1/admin/contracts", handlers.ListContracts(contractCfg))
 	mux.HandleFunc("DELETE /v1/admin/contracts/{id}", handlers.DeleteContract(contractCfg))
 	// API key management (admin-only via X-Admin-Key header)
-	mux.HandleFunc("POST /v1/api-keys", handlers.CreateAPIKey(apiKeyCfg))
+	mux.Handle("POST /v1/api-keys", idempotency(handlers.CreateAPIKey(apiKeyCfg)))
 	mux.HandleFunc("GET /v1/api-keys", handlers.ListAPIKeys(apiKeyCfg))
 	mux.HandleFunc("PATCH /v1/api-keys/{id}", handlers.UpdateAPIKey(apiKeyCfg))
 	mux.HandleFunc("DELETE /v1/api-keys/{id}", handlers.DeleteAPIKey(apiKeyCfg))
@@ -314,7 +322,7 @@ func main() {
 	}
 	mux.HandleFunc("POST /v1/contracts/{id}/call", handlers.CallContract(sorobanCaller))
 	mux.HandleFunc("GET /v1/webhooks", listWebhooksHandler(webhookDB))
-	mux.HandleFunc("POST /v1/webhooks", createWebhookHandler(webhookDB))
+	mux.Handle("POST /v1/webhooks", idempotency(createWebhookHandler(webhookDB)))
 	mux.HandleFunc("DELETE /v1/webhooks/{id}", deleteWebhookHandler(webhookDB))
 	mux.HandleFunc("PATCH /v1/webhooks/{id}/pause", pauseWebhookHandler(webhookDB))
 	mux.HandleFunc("PATCH /v1/webhooks/{id}/resume", resumeWebhookHandler(webhookDB))

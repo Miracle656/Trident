@@ -26,6 +26,10 @@ const (
 	// request outright (e.g. the global concurrency cap shedding load,
 	// issue #318) rather than for a normal auth failure.
 	FORBIDDEN ErrorCode = "FORBIDDEN"
+	// CONFLICT is returned when a request conflicts with existing state —
+	// notably an Idempotency-Key reused with a different request body
+	// (issue #426).
+	CONFLICT ErrorCode = "CONFLICT"
 )
 
 // ErrorDetail is the nested error object required by the OpenAPI ErrorResponse
