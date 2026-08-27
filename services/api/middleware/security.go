@@ -57,10 +57,29 @@ func ValidateAllowedOrigins() ([]string, error) {
 
 // SecurityHeaders returns middleware that sets standard security headers on
 // every response. HSTS is only set when TLS is enforced (production).
+//
+// CSP is configured for the public explorer with SSE support:
+//   - default-src 'self'
+//   - script-src 'self' (no unsafe-inline — justified: explorer uses bundled JS)
+//   - style-src 'self' 'unsafe-inline' (justified: CSS-in-JS requires inline styles)
+//   - connect-src 'self' wss: ws: (SSE/WebSocket for real-time events)
+//   - img-src 'self' data: (inline images for icons)
 func SecurityHeaders(isProduction bool) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			h := w.Header()
+
+			// Content-Security-Policy: restrict resource loading to same-origin.
+			// 'unsafe-inline' for styles is justified: the explorer uses CSS-in-JS.
+			h.Set("Content-Security-Policy",
+				"default-src 'self'; "+
+					"script-src 'self'; "+
+					"style-src 'self' 'unsafe-inline'; "+
+					"connect-src 'self' wss: ws:; "+
+					"img-src 'self' data:; "+
+					"font-src 'self'; "+
+					"object-src 'none'; "+
+					"frame-ancestors 'none'")
 
 			// X-Content-Type-Options: prevent MIME-sniffing (all responses).
 			h.Set("X-Content-Type-Options", "nosniff")

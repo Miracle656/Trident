@@ -1,8 +1,15 @@
-//! RPC endpoint health scoring system (multi-RPC failover).
+//! RPC endpoint health scoring system (multi-RPC failover) with circuit breaker.
 //!
 //! Maintains a dynamic score (0–100) per endpoint based on observed behavior.
 //! Higher scores indicate healthier endpoints. The scorer routes traffic to the
 //! healthiest endpoint, with automatic failover and recovery.
+//!
+//! ## Circuit Breaker
+//!
+//! Each endpoint has a circuit breaker with three states:
+//! - **Closed**: Normal operation. Requests pass through.
+//! - **Open**: Circuit tripped after consecutive failures. Requests rejected immediately.
+//! - **Half-Open**: After a timeout, one test request allowed to check recovery.
 //!
 //! ## Score rules
 //!
@@ -61,6 +68,23 @@ const RECOVER_SUCCESS: u8 = 5;
 /// Threshold for considering a ledger stale (30 seconds).
 const STALE_LEDGER_THRESHOLD: Duration = Duration::from_secs(30);
 
+/// Number of consecutive failures before the circuit breaker trips.
+const CIRCUIT_BREAKER_THRESHOLD: u32 = 5;
+
+/// Duration to keep the circuit breaker open before transitioning to half-open.
+const CIRCUIT_BREAKER_OPEN_DURATION: Duration = Duration::from_secs(30);
+
+/// Circuit breaker states.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CircuitState {
+    /// Normal operation — requests pass through.
+    Closed,
+    /// Circuit tripped — requests rejected immediately.
+    Open,
+    /// Recovery probe — one test request allowed.
+    HalfOpen,
+}
+
 /// Health state for a single endpoint.
 #[derive(Debug, Clone)]
 struct EndpointHealth {
@@ -68,6 +92,9 @@ struct EndpointHealth {
     last_success: Option<Instant>,
     last_ledger: Option<u64>,
     last_ledger_timestamp: Option<Instant>,
+    circuit_state: CircuitState,
+    consecutive_failures: u32,
+    circuit_opened_at: Option<Instant>,
 }
 
 impl EndpointHealth {
@@ -77,6 +104,9 @@ impl EndpointHealth {
             last_success: None,
             last_ledger: None,
             last_ledger_timestamp: None,
+            circuit_state: CircuitState::Closed,
+            consecutive_failures: 0,
+            circuit_opened_at: None,
         }
     }
 
@@ -90,6 +120,27 @@ impl EndpointHealth {
     fn apply_recovery(&mut self) {
         self.score = self.score.saturating_add(RECOVER_SUCCESS).min(MAX_SCORE);
         self.last_success = Some(Instant::now());
+        self.consecutive_failures = 0;
+        self.circuit_state = CircuitState::Closed;
+    }
+
+    fn record_failure(&mut self) {
+        self.consecutive_failures += 1;
+        if self.consecutive_failures >= CIRCUIT_BREAKER_THRESHOLD {
+            self.circuit_state = CircuitState::Open;
+            self.circuit_opened_at = Some(Instant::now());
+        }
+    }
+
+    fn check_circuit(&mut self) -> CircuitState {
+        if self.circuit_state == CircuitState::Open {
+            if let Some(opened_at) = self.circuit_opened_at {
+                if opened_at.elapsed() >= CIRCUIT_BREAKER_OPEN_DURATION {
+                    self.circuit_state = CircuitState::HalfOpen;
+                }
+            }
+        }
+        self.circuit_state
     }
 
     fn update_ledger(&mut self, ledger: u64) {
@@ -146,7 +197,7 @@ impl RpcHealthScorer {
     /// Record a successful RPC response from the given endpoint.
     ///
     /// Increases the endpoint's score by 5 (capped at 100) and records the
-    /// current ledger if provided.
+    /// current ledger if provided. Resets the circuit breaker to closed.
     pub fn record_success(&self, url: &str, ledger: Option<u64>) {
         if let Ok(mut endpoints) = self.endpoints.write() {
             if let Some(health) = endpoints.get_mut(url) {
@@ -162,6 +213,34 @@ impl RpcHealthScorer {
                 }
             }
         }
+    }
+
+    /// Check if the endpoint's circuit breaker allows requests.
+    ///
+    /// Returns true if the circuit is closed or half-open (probe allowed).
+    #[allow(dead_code)]
+    pub fn is_circuit_allowed(&self, url: &str) -> bool {
+        if let Ok(mut endpoints) = self.endpoints.write() {
+            if let Some(health) = endpoints.get_mut(url) {
+                let state = health.check_circuit();
+                metrics::set_rpc_circuit_state(url, &format!("{:?}", state));
+                return state != CircuitState::Open;
+            }
+        }
+        true
+    }
+
+    /// Get the circuit breaker state for an endpoint.
+    #[allow(dead_code)]
+    pub fn get_circuit_state(&self, url: &str) -> CircuitState {
+        if let Ok(mut endpoints) = self.endpoints.write() {
+            if let Some(health) = endpoints.get_mut(url) {
+                let state = health.check_circuit();
+                metrics::set_rpc_circuit_state(url, &format!("{:?}", state));
+                return state;
+            }
+        }
+        CircuitState::Closed
     }
 
     /// Record a timeout error from the given endpoint.
@@ -246,9 +325,10 @@ impl RpcHealthScorer {
     ///
     /// Returns the URL of the endpoint with the highest score. If multiple
     /// endpoints have the same score, prefers the one most recently successful.
+    /// Endpoints whose circuit breaker is Open are skipped entirely.
     pub fn select_best_endpoint(&self) -> String {
         let scores = self.scores.read().expect("scores lock poisoned");
-        let endpoints = self.endpoints.read().expect("endpoints lock poisoned");
+        let mut endpoints = self.endpoints.write().expect("endpoints lock poisoned");
 
         let mut best_url: Option<&String> = None;
         let mut best_score = MIN_SCORE;
@@ -258,9 +338,15 @@ impl RpcHealthScorer {
         // the earlier-listed endpoint keeps serving. Iterating the HashMap
         // instead would make the choice depend on hash order.
         for url in &self.priority {
-            let Some(health) = endpoints.get(url) else {
+            let Some(health) = endpoints.get_mut(url) else {
                 continue;
             };
+
+            // Skip endpoints whose circuit breaker has tripped.
+            if health.check_circuit() == CircuitState::Open {
+                continue;
+            }
+
             let score = scores.get(url).copied().unwrap_or(INITIAL_SCORE);
             let last_success = health.last_success;
 
@@ -317,6 +403,11 @@ impl RpcHealthScorer {
         if let Ok(mut endpoints) = self.endpoints.write() {
             if let Some(health) = endpoints.get_mut(url) {
                 health.apply_deduction(amount);
+                health.record_failure();
+
+                // Publish circuit breaker state if it changed
+                let state = health.circuit_state;
+                metrics::set_rpc_circuit_state(url, &format!("{:?}", state));
 
                 // Update the read-optimized scores map and publish metric
                 if let Ok(mut scores) = self.scores.write() {
@@ -509,5 +600,56 @@ mod tests {
         s.record_timeout("https://unknown.example");
         s.record_success("https://unknown.example", Some(100));
         assert_eq!(s.get_score("https://unknown.example"), 100); // Default
+    }
+
+    #[test]
+    fn circuit_breaker_opens_after_threshold_failures() {
+        let s = scorer();
+        for _ in 0..CIRCUIT_BREAKER_THRESHOLD {
+            s.record_timeout("https://primary.example");
+        }
+        assert_eq!(
+            s.get_circuit_state("https://primary.example"),
+            CircuitState::Open
+        );
+    }
+
+    #[test]
+    fn circuit_breaker_skips_open_endpoint() {
+        let s = scorer();
+        // Trip the primary's circuit breaker
+        for _ in 0..CIRCUIT_BREAKER_THRESHOLD {
+            s.record_connection_refused("https://primary.example");
+        }
+        // select_best_endpoint should skip primary and return backup
+        assert_eq!(s.select_best_endpoint(), "https://backup.example");
+    }
+
+    #[test]
+    fn circuit_breaker_success_resets_to_closed() {
+        let s = scorer();
+        for _ in 0..CIRCUIT_BREAKER_THRESHOLD {
+            s.record_timeout("https://primary.example");
+        }
+        assert_eq!(
+            s.get_circuit_state("https://primary.example"),
+            CircuitState::Open
+        );
+        // A success should reset the circuit breaker
+        s.record_success("https://primary.example", Some(100));
+        assert_eq!(
+            s.get_circuit_state("https://primary.example"),
+            CircuitState::Closed
+        );
+    }
+
+    #[test]
+    fn circuit_breaker_is_circuit_allowed() {
+        let s = scorer();
+        assert!(s.is_circuit_allowed("https://primary.example"));
+        for _ in 0..CIRCUIT_BREAKER_THRESHOLD {
+            s.record_timeout("https://primary.example");
+        }
+        assert!(!s.is_circuit_allowed("https://primary.example"));
     }
 }

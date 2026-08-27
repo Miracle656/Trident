@@ -861,6 +861,29 @@ impl Streamer {
                 })
                 .collect();
 
+            // Reorg detection (#412): compare the RPC-reported ledger hash
+            // against the stored hash before committing. On mismatch, rewind
+            // the cursor to the fork point and re-index.
+            if ledger_sequence > 0 && !ledger_hash.is_empty() {
+                match db::check_ledger_reorg(&self.db, ledger_sequence, &ledger_hash).await {
+                    Ok(false) => {
+                        tracing::warn!(
+                            sequence = ledger_sequence,
+                            "Ledger reorg detected — rewinding cursor"
+                        );
+                        metrics::record_reorg();
+                        let rewind_target = ledger_sequence.saturating_sub(1);
+                        db::rewind_cursor(&self.db, rewind_target).await?;
+                        *cursor = rewind_target;
+                        break;
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Failed to check ledger reorg");
+                    }
+                    _ => {}
+                }
+            }
+
             db::commit_page(
                 &self.db,
                 db::PageCommit {
@@ -915,6 +938,23 @@ impl Streamer {
         // Recompute lag once the loop settles so it reflects the final cursor
         // relative to the chain tip (zero once we have caught up).
         metrics::set_ledger_lag(self.last_chain_tip.saturating_sub(*cursor) as i64);
+
+        // Gap detection (#413): scan for missing ledger sequences and publish
+        // the count so operators can see gaps and trigger backfill.
+        if *cursor > 1 {
+            match db::detect_ledger_gaps(&self.db, 1, *cursor).await {
+                Ok(gaps) => {
+                    let gap_count = gaps.len() as i64;
+                    metrics::set_ledger_gaps(gap_count);
+                    if gap_count > 0 {
+                        tracing::warn!(gaps = gap_count, "Ledger gaps detected in processed range");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "Failed to detect ledger gaps");
+                }
+            }
+        }
 
         // Write health stats after every successful cycle (issue #62).
         // Non-fatal: log on failure so a bad health write doesn't stop indexing.
