@@ -63,6 +63,7 @@ func TestDecodeInvalidInputs(t *testing.T) {
 		// base64url("hello") — valid base64 but not a JSON cursor payload
 		{"valid base64 not JSON", base64.URLEncoding.WithPadding(base64.NoPadding).EncodeToString([]byte("hello"))},
 		{"wrong version", wrongVersion},
+		{"over the length cap", strings.Repeat("A", 257)},
 	}
 
 	for _, tc := range cases {

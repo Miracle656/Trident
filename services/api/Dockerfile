@@ -1,7 +1,12 @@
 # syntax=docker/dockerfile:1
 
 # ── builder ──────────────────────────────────────────────────────────────────
-FROM golang:1.25-alpine@sha256:1e0126852075c9c60731c8ba49088448b91f63e2aed97ca9d1a9791622a05946 AS builder
+# The pinned digest determines the Go toolchain compiled into the binary, so a
+# stale pin ships stdlib CVEs that trivy flags against usr/local/bin/api. This
+# digest is Go 1.25.14; the previous one was 1.25.12, which predates the
+# 1.25.13 fixes for CVE-2026-33818, -39821, -56853, -56858, -56859, -56860
+# and -56862.
+FROM golang:1.25-alpine@sha256:1ae0735f00daffa3aaf1363a5184c0d2dc55c78e3db4ec70241cdac97bf84b59 AS builder
 
 WORKDIR /build
 

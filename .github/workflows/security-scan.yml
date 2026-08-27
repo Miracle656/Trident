@@ -128,15 +128,23 @@ jobs:
         with:
           go-version: "1.25"
 
+      # govulncheck reports standard-library advisories against the toolchain
+      # it runs under, so leaving this at the action's default ('stable') makes
+      # the result depend on whatever Go was released most recently rather than
+      # on what we ship. Pin it to the 1.25 line — the same minor as
+      # services/api/Dockerfile's builder and the `go` directive in both
+      # modules — so a finding here means the released binary is affected.
       - name: govulncheck (services/api)
         uses: golang/govulncheck-action@032d45514ae346b1db93c04b0c90b841c370344f # v1.1.0
         with:
           work-dir: services/api
+          go-version-input: "1.25"
 
       - name: govulncheck (sdk/go)
         uses: golang/govulncheck-action@032d45514ae346b1db93c04b0c90b841c370344f # v1.1.0
         with:
           work-dir: sdk/go
+          go-version-input: "1.25"
 
       - name: Set up Node
         uses: actions/setup-node@60edb5dd545a775178f52524783378180af0d1f8 # v4.0.2

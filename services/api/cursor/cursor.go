@@ -35,6 +35,9 @@ func Decode(opaque string) (string, error) {
 	if opaque == "" {
 		return "", errors.New("cursor: empty cursor string")
 	}
+	if len(opaque) > 256 {
+		return "", errors.New("cursor: payload too large")
+	}
 
 	data, err := base64.URLEncoding.WithPadding(base64.NoPadding).DecodeString(opaque)
 	if err != nil {
