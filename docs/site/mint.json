@@ -78,6 +78,7 @@
         "api-reference/authentication",
         "api-reference/pagination",
         "api-reference/rate-limiting",
+        "api-reference/idempotency",
         "api-reference/events-list",
         "api-reference/events-get",
         "api-reference/health"
