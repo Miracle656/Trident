@@ -50,9 +50,10 @@ func TestDecodeEmptyToken(t *testing.T) {
 }
 
 func TestDecodeInvalidInputs(t *testing.T) {
-	// Manually craft a v=99 cursor to test version rejection.
+	// Manually craft a v=99 envelope to test version rejection (signature
+	// need not be valid; version is checked first).
 	wrongVersion := base64.URLEncoding.WithPadding(base64.NoPadding).
-		EncodeToString([]byte(`{"v":99,"t":"tok"}`))
+		EncodeToString([]byte(`{"p":{"v":99,"t":"tok"},"s":"x"}`))
 
 	cases := []struct {
 		name  string
@@ -60,10 +61,10 @@ func TestDecodeInvalidInputs(t *testing.T) {
 	}{
 		{"empty string", ""},
 		{"not base64", "!!!notbase64!!!"},
-		// base64url("hello") — valid base64 but not a JSON cursor payload
+		// base64url("hello") — valid base64 but not a JSON cursor envelope
 		{"valid base64 not JSON", base64.URLEncoding.WithPadding(base64.NoPadding).EncodeToString([]byte("hello"))},
 		{"wrong version", wrongVersion},
-		{"over the length cap", strings.Repeat("A", 257)},
+		{"over the length cap", strings.Repeat("A", 513)},
 	}
 
 	for _, tc := range cases {
@@ -71,5 +72,52 @@ func TestDecodeInvalidInputs(t *testing.T) {
 		if err == nil {
 			t.Errorf("case %q: expected error for input %q, got nil", tc.name, tc.input)
 		}
+	}
+}
+
+// TestTamperedCursorRejected asserts the integrity-check requirement of
+// issue #423: flipping a byte in the encoded token (as an attacker forging a
+// cursor to skip/replay pages would) must be detected and rejected, not
+// silently decoded to a different token.
+func TestTamperedCursorRejected(t *testing.T) {
+	opaque := cursor.Encode("id:00000000-0000-0000-0000-000000000001")
+
+	raw, err := base64.URLEncoding.WithPadding(base64.NoPadding).DecodeString(opaque)
+	if err != nil {
+		t.Fatalf("decode base64: %v", err)
+	}
+
+	tampered := string(raw)
+	// Try to rewrite the embedded token to a different id while leaving the
+	// (now invalid) signature bytes alone.
+	tampered = strings.Replace(tampered, "000000000001", "000000000002", 1)
+	if tampered == string(raw) {
+		t.Fatal("test setup: substring to tamper not found in payload")
+	}
+	tamperedOpaque := base64.URLEncoding.WithPadding(base64.NoPadding).EncodeToString([]byte(tampered))
+
+	if _, err := cursor.Decode(tamperedOpaque); err == nil {
+		t.Error("expected tampered cursor to be rejected, but Decode succeeded")
+	}
+}
+
+// TestDifferentSecretsRejected confirms a cursor signed under one secret is
+// rejected once the signing secret changes — e.g. across a documented key
+// rotation.
+func TestDifferentSecretsRejected(t *testing.T) {
+	if err := cursor.SetSecret([]byte("secret-one")); err != nil {
+		t.Fatalf("SetSecret: %v", err)
+	}
+	opaque := cursor.Encode("some-token")
+
+	if err := cursor.SetSecret([]byte("secret-two")); err != nil {
+		t.Fatalf("SetSecret: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = cursor.SetSecret([]byte("secret-one"))
+	})
+
+	if _, err := cursor.Decode(opaque); err == nil {
+		t.Error("expected cursor signed under a different secret to be rejected")
 	}
 }
