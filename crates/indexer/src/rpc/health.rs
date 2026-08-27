@@ -371,7 +371,20 @@ impl RpcHealthScorer {
             }
         }
 
-        best_url.expect("at least one endpoint").clone()
+        // Every circuit open means the loop above skipped every endpoint, so
+        // there is no "best" one. Panicking here would take the indexer down
+        // in precisely the situation the breaker exists to survive — a total
+        // RPC outage — so fall back to the highest-priority endpoint and let
+        // the call fail normally. The caller already handles a failed request
+        // (retry, backoff, poll error), and the half-open probe still runs on
+        // its own timer, so this degrades to "keep trying the primary" rather
+        // than "crash".
+        //
+        // `priority` is non-empty: RpcHealthScorer::new rejects an empty
+        // endpoint list, so the unwrap_or_else below cannot itself panic.
+        best_url
+            .cloned()
+            .unwrap_or_else(|| self.priority[0].clone())
     }
 
     /// Get the current score for a specific endpoint.
@@ -651,5 +664,27 @@ mod tests {
             s.record_timeout("https://primary.example");
         }
         assert!(!s.is_circuit_allowed("https://primary.example"));
+    }
+
+    /// A total RPC outage trips every circuit, which left the selection loop
+    /// with no candidate and an `.expect()` that panicked — taking the
+    /// indexer down in exactly the case the breaker exists to survive.
+    /// Selection must still return an endpoint so the call can fail normally.
+    #[test]
+    fn select_best_endpoint_falls_back_when_every_circuit_is_open() {
+        let s = scorer();
+        for url in ["https://primary.example", "https://backup.example"] {
+            for _ in 0..CIRCUIT_BREAKER_THRESHOLD {
+                s.record_timeout(url);
+            }
+            assert!(!s.is_circuit_allowed(url), "{url} circuit should be open");
+        }
+
+        // Must not panic, and must return a configured endpoint.
+        let selected = s.select_best_endpoint();
+        assert!(
+            selected == "https://primary.example" || selected == "https://backup.example",
+            "fallback returned an unconfigured endpoint: {selected}"
+        );
     }
 }
