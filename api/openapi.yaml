@@ -1380,10 +1380,30 @@ components:
           properties:
             code:
               type: string
-              description: Error code (e.g., INVALID_ARGUMENT, INTERNAL, UNAVAILABLE)
+              description: >-
+                Machine-readable error code. Stable across releases — branch
+                on this, not on `message`. See docs/errors.md for the full
+                catalogue (meaning, HTTP status, and retry guidance for each
+                code).
+              enum:
+                - INVALID_ARGUMENT
+                - UNAUTHORIZED
+                - FORBIDDEN
+                - NOT_FOUND
+                - PAYLOAD_TOO_LARGE
+                - RATE_LIMITED
+                - INTERNAL
+                - UNAVAILABLE
             message:
               type: string
-              description: Human-readable error message
+              description: Human-readable error message. Not stable; do not pattern-match on it.
+            details:
+              type: object
+              additionalProperties: true
+              description: >-
+                Optional structured context specific to `code` (e.g. which
+                request field failed validation). Absent when there is
+                nothing more specific than `message`.
             request_id:
               type: string
               description: Request ID for debugging

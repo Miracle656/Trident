@@ -29,11 +29,15 @@ const (
 )
 
 // ErrorDetail is the nested error object required by the OpenAPI ErrorResponse
-// schema and parsed by the client SDKs.
+// schema and parsed by the client SDKs. Every field but Code and Message is
+// optional: Details carries structured, code-specific context (e.g. which
+// field failed validation) and RequestID lets a client correlate a failure
+// with server logs and traces.
 type ErrorDetail struct {
-	Code      ErrorCode `json:"code"`
-	Message   string    `json:"message"`
-	RequestID string    `json:"request_id,omitempty"`
+	Code      ErrorCode      `json:"code"`
+	Message   string         `json:"message"`
+	Details   map[string]any `json:"details,omitempty"`
+	RequestID string         `json:"request_id,omitempty"`
 }
 
 // ErrorResponse is the standardized JSON error body: {"error":{"code","message"}}.
@@ -45,22 +49,48 @@ type ErrorResponse struct {
 // ErrorResponse schema ({"error":{"code","message"}}). It carries no request
 // id; prefer WriteErrorCtx from a request-scoped handler so the error envelope
 // includes error.request_id.
+//
+// code must be one of the constants declared in this package (all of which
+// are registered in Registry, see registry.go); every call site is covered
+// by registry_test.go's static check, and this is the only path (along with
+// WriteErrorCtx/WriteErrorDetails/WriteErrorCtxDetails) by which an error
+// code reaches a client, so the registry is the complete catalogue of codes
+// this API can emit.
 func WriteError(w http.ResponseWriter, statusCode int, code ErrorCode, message string) {
-	writeError(w, statusCode, code, message, "")
+	writeError(w, statusCode, code, message, nil, "")
 }
 
 // WriteErrorCtx writes a standardized JSON error response and populates
 // error.request_id from the request id attached to ctx by the RequestID
 // middleware, so a client failure can be correlated to server logs and traces.
 func WriteErrorCtx(ctx context.Context, w http.ResponseWriter, statusCode int, code ErrorCode, message string) {
-	writeError(w, statusCode, code, message, RequestIDFromContext(ctx))
+	writeError(w, statusCode, code, message, nil, RequestIDFromContext(ctx))
 }
 
-func writeError(w http.ResponseWriter, statusCode int, code ErrorCode, message, requestID string) {
+// WriteErrorDetails is WriteError plus a structured details payload (e.g.
+// {"field": "contractId"}) for callers that need to carry machine-readable
+// context beyond the human-readable message.
+func WriteErrorDetails(w http.ResponseWriter, statusCode int, code ErrorCode, message string, details map[string]any) {
+	writeError(w, statusCode, code, message, details, "")
+}
+
+// WriteErrorCtxDetails combines WriteErrorCtx and WriteErrorDetails.
+func WriteErrorCtxDetails(ctx context.Context, w http.ResponseWriter, statusCode int, code ErrorCode, message string, details map[string]any) {
+	writeError(w, statusCode, code, message, details, RequestIDFromContext(ctx))
+}
+
+func writeError(w http.ResponseWriter, statusCode int, code ErrorCode, message string, details map[string]any, requestID string) {
+	// Defense in depth: every constant in this package is registered (see
+	// registry_test.go), but guard against a future hardcoded literal
+	// slipping past review by falling back to the documented INTERNAL code
+	// rather than emitting an undocumented one to a client.
+	if !IsRegistered(code) {
+		code = INTERNAL
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(statusCode)
 	_ = json.NewEncoder(w).Encode(ErrorResponse{
-		Error: ErrorDetail{Code: code, Message: message, RequestID: requestID},
+		Error: ErrorDetail{Code: code, Message: message, Details: details, RequestID: requestID},
 	})
 }
 

@@ -14,7 +14,7 @@ import {
 import type { RetryConfig } from "./retry.js";
 
 export { TridentError, TridentApiError } from "./errors.js";
-export type { TridentErrorCode } from "./errors.js";
+export type { TridentErrorCode, ApiErrorCode } from "./errors.js";
 export { ENV_API_KEY, ENV_BASE_URL, redactKey } from "./config.js";
 export { iterEvents, DEFAULT_MAX_PAGES } from "./iterator.js";
 export type { IterEventsOptions, QueryEventsFn } from "./iterator.js";

@@ -1,5 +1,28 @@
 import { z } from "zod";
 
+/**
+ * Machine-readable codes the Trident API can return in an error envelope's
+ * `error.code` field, kept in sync with the catalogue documented in
+ * docs/errors.md and services/api/internal/httputil/registry.go. Branch on
+ * `TridentApiError.code` using this type rather than matching on `message`,
+ * which is not stable across releases.
+ */
+export type ApiErrorCode =
+  | "INVALID_ARGUMENT"
+  | "UNAUTHORIZED"
+  | "FORBIDDEN"
+  | "NOT_FOUND"
+  | "PAYLOAD_TOO_LARGE"
+  | "RATE_LIMITED"
+  | "INTERNAL"
+  | "UNAVAILABLE";
+
+/**
+ * Client-side error codes raised by the SDK itself (config problems,
+ * iteration limits, retry exhaustion) rather than parsed from a server
+ * response. Distinct from {@link ApiErrorCode}, which is the server-defined
+ * catalogue.
+ */
 export type TridentErrorCode =
   | "CONFIG"
   | "NOT_FOUND"
@@ -33,17 +56,33 @@ export class TridentError extends Error {
  */
 export class TridentApiError extends Error {
   readonly status: number;
-  readonly code: string;
+  /**
+   * Typed as `ApiErrorCode | (string & {})`: editors autocomplete and
+   * type-check against the documented catalogue, but a server response
+   * carrying a code newer than this SDK build still deserializes instead of
+   * failing, so a client can safely fall through to a default case on an
+   * unrecognized value rather than crash.
+   */
+  readonly code: ApiErrorCode | (string & {});
   readonly field?: string;
+  /** Structured, code-specific context from the envelope's `error.details`. */
+  readonly details?: Record<string, unknown>;
   /** Number of attempts made before this error was thrown (>1 if retried). */
   attempts: number;
 
-  constructor(status: number, code: string, message: string, field?: string) {
+  constructor(
+    status: number,
+    code: ApiErrorCode | (string & {}),
+    message: string,
+    field?: string,
+    details?: Record<string, unknown>,
+  ) {
     super(message);
     this.name = "TridentApiError";
     this.status = status;
     this.code = code;
     this.field = field;
+    this.details = details;
     this.attempts = 1;
   }
 }
@@ -53,6 +92,7 @@ const ApiErrorEnvelopeSchema = z.object({
     code: z.string(),
     message: z.string(),
     field: z.string().optional(),
+    details: z.record(z.string(), z.unknown()).optional(),
   }),
 });
 
@@ -63,8 +103,8 @@ const ApiErrorEnvelopeSchema = z.object({
 export function parseApiError(status: number, body: string): TridentApiError {
   try {
     const parsed = ApiErrorEnvelopeSchema.parse(JSON.parse(body));
-    const { code, message, field } = parsed.error;
-    return new TridentApiError(status, code, message, field);
+    const { code, message, field, details } = parsed.error;
+    return new TridentApiError(status, code, message, field, details);
   } catch {
     return new TridentApiError(status, "INTERNAL", body || `HTTP ${status}`);
   }
