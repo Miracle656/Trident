@@ -38,6 +38,18 @@ use crate::{
 /// At the default 5 s poll interval this is ≈ 60 s — matches the env-var default.
 const FILTER_REFRESH_EVERY_N_POLLS: u32 = 12;
 
+/// How far back the gap scan looks (issue #413). Bounded so the scan cost
+/// stays constant instead of growing with chain height — at ~5s per ledger
+/// this covers roughly the last 14 hours of ingest, which is the window where
+/// a gap is still worth repairing automatically. Anything older is a backfill
+/// job (`trident-backfill`), surfaced by the gap gauge rather than re-scanned
+/// on every cycle.
+const GAP_SCAN_WINDOW_LEDGERS: u64 = 10_000;
+
+/// Gap scanning is a periodic audit, not per-poll work — keeping it off the
+/// ingest hot path matters more than sub-minute detection latency.
+const GAP_SCAN_EVERY_N_POLLS: u32 = 60;
+
 pub struct Streamer {
     config: Config,
     db: PgPool,
@@ -941,13 +953,29 @@ impl Streamer {
 
         // Gap detection (#413): scan for missing ledger sequences and publish
         // the count so operators can see gaps and trigger backfill.
-        if *cursor > 1 {
-            match db::detect_ledger_gaps(&self.db, 1, *cursor).await {
+        //
+        // Scanned over a bounded trailing window, not the whole processed
+        // range: `generate_series(1, cursor)` would materialise ~4M rows per
+        // call at current testnet height and grow forever. A gap older than
+        // this window is a backfill job, not something the poll loop should
+        // rediscover every cycle.
+        //
+        // Throttled to its own interval for the same reason — this is a
+        // periodic audit, and running it per-poll puts a growing scan on the
+        // ingest hot path.
+        if *cursor > 1 && self.poll_count.is_multiple_of(GAP_SCAN_EVERY_N_POLLS) {
+            let from = cursor.saturating_sub(GAP_SCAN_WINDOW_LEDGERS).max(1);
+            match db::detect_ledger_gaps(&self.db, from, *cursor).await {
                 Ok(gaps) => {
                     let gap_count = gaps.len() as i64;
                     metrics::set_ledger_gaps(gap_count);
                     if gap_count > 0 {
-                        tracing::warn!(gaps = gap_count, "Ledger gaps detected in processed range");
+                        tracing::warn!(
+                            gaps = gap_count,
+                            from,
+                            to = *cursor,
+                            "Ledger gaps detected in scanned window"
+                        );
                     }
                 }
                 Err(e) => {

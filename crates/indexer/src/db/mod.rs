@@ -686,13 +686,14 @@ pub async fn check_ledger_reorg(
     if new_hash.is_empty() {
         return Ok(true); // no hash to compare
     }
-    let row: Option<(String,)> = sqlx::query_as(
-        "SELECT ledger_hash FROM ledger_metadata WHERE ledger_sequence = $1",
-    )
-    .bind(sequence as i64)
-    .fetch_optional(pool)
-    .await
-    .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("check_ledger_reorg")))?;
+    let row: Option<(String,)> =
+        sqlx::query_as("SELECT ledger_hash FROM ledger_metadata WHERE ledger_sequence = $1")
+            .bind(sequence as i64)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| {
+                TridentError::storage(anyhow::Error::new(e).context("check_ledger_reorg"))
+            })?;
 
     match row {
         Some((stored_hash,)) if !stored_hash.is_empty() && stored_hash != new_hash => Ok(false),
@@ -703,9 +704,10 @@ pub async fn check_ledger_reorg(
 /// Rewind the cursor to `target` and delete all ledger metadata and events
 /// at sequences > `target`. Used to undo a reorg.
 pub async fn rewind_cursor(pool: &PgPool, target: u64) -> Result<(), TridentError> {
-    let mut tx = pool.begin().await.map_err(|e| {
-        TridentError::storage(anyhow::Error::new(e).context("rewind_cursor begin"))
-    })?;
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("rewind_cursor begin")))?;
 
     sqlx::query("DELETE FROM ledger_metadata WHERE ledger_sequence > $1")
         .bind(target as i64)
@@ -715,13 +717,48 @@ pub async fn rewind_cursor(pool: &PgPool, target: u64) -> Result<(), TridentErro
             TridentError::storage(anyhow::Error::new(e).context("rewind_cursor delete_metadata"))
         })?;
 
-    sqlx::query("DELETE FROM events WHERE ledger_sequence > $1")
+    // soroban_events, not `events` — there is no table by that name, so the
+    // original statement here aborted the transaction and left the reorg
+    // unrepaired while the logs reported it as handled.
+    //
+    // token_events references soroban_events(id) ON DELETE CASCADE, so it is
+    // cleaned up by this delete. event_outbox keys on event_id with no FK, so
+    // orphaned rows are removed explicitly below. The remaining ledger-keyed
+    // tables have neither an FK nor a cascade and are deleted by sequence.
+    sqlx::query(
+        "DELETE FROM event_outbox WHERE event_id IN \
+         (SELECT id FROM soroban_events WHERE ledger_sequence > $1)",
+    )
+    .bind(target as i64)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| {
+        TridentError::storage(anyhow::Error::new(e).context("rewind_cursor delete_outbox"))
+    })?;
+
+    sqlx::query("DELETE FROM soroban_events WHERE ledger_sequence > $1")
         .bind(target as i64)
         .execute(&mut *tx)
         .await
         .map_err(|e| {
             TridentError::storage(anyhow::Error::new(e).context("rewind_cursor delete_events"))
         })?;
+
+    for table in [
+        "contract_invocation_metrics",
+        "contract_storage_snapshots",
+        "parse_errors",
+    ] {
+        sqlx::query(&format!("DELETE FROM {table} WHERE ledger_sequence > $1"))
+            .bind(target as i64)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| {
+                TridentError::storage(
+                    anyhow::Error::new(e).context(format!("rewind_cursor delete_{table}")),
+                )
+            })?;
+    }
 
     sqlx::query(
         "UPDATE system_state SET value = $1, updated_at = NOW() WHERE key = 'latest_ledger_cursor'",
@@ -1248,6 +1285,73 @@ mod tests {
 
         sqlx::query("DELETE FROM token_metadata WHERE contract_id = $1")
             .bind(&contract_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    /// A reorg rewind must actually remove the rows above the fork point.
+    ///
+    /// This is a regression test for a `DELETE FROM events` that referenced a
+    /// table which does not exist: the statement errored, the transaction
+    /// rolled back, and the rewind silently did nothing while the logs
+    /// reported a reorg as handled. Asserting on row counts after the call is
+    /// what catches that — the query string alone looks plausible.
+    #[tokio::test]
+    async fn rewind_cursor_deletes_rows_above_the_fork_point() {
+        let db_url = match std::env::var("TEST_DATABASE_URL") {
+            Ok(url) => url,
+            Err(_) if std::env::var("REQUIRE_TEST_SERVICES").is_ok() => {
+                panic!("TEST_DATABASE_URL must be set when REQUIRE_TEST_SERVICES is set");
+            }
+            Err(_) => {
+                eprintln!("SKIP: TEST_DATABASE_URL not set");
+                return;
+            }
+        };
+        let pool = PgPool::connect(&db_url).await.unwrap();
+
+        let contract = "CREORG_TEST_CONTRACT";
+        let keep = make_event(contract, 5_000, 0);
+        let discard = make_event(contract, 5_001, 0);
+
+        sqlx::query("DELETE FROM soroban_events WHERE contract_id = $1")
+            .bind(contract)
+            .execute(&pool)
+            .await
+            .expect("cleanup failed");
+
+        insert_events_batch(&pool, &[keep.clone(), discard.clone()])
+            .await
+            .expect("seed insert failed");
+
+        rewind_cursor(&pool, 5_000).await.expect("rewind failed");
+
+        let remaining: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM soroban_events WHERE contract_id = $1 AND ledger_sequence > $2",
+        )
+        .bind(contract)
+        .bind(5_000_i64)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            remaining.0, 0,
+            "rows above the fork point must be deleted by the rewind"
+        );
+
+        let kept: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM soroban_events WHERE contract_id = $1 AND ledger_sequence = $2",
+        )
+        .bind(contract)
+        .bind(5_000_i64)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(kept.0, 1, "rows at or below the fork point must survive");
+
+        sqlx::query("DELETE FROM soroban_events WHERE contract_id = $1")
+            .bind(contract)
             .execute(&pool)
             .await
             .unwrap();
