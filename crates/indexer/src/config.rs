@@ -51,6 +51,12 @@ pub struct Config {
     pub max_events_per_poll: u32,
     /// Maximum rows per batched INSERT when committing a page (issue #199).
     pub db_batch_size: usize,
+    /// Max entries retained in the shared `trident:events` Redis stream
+    /// before trimming (issue #428). This bounds how long an SSE/gRPC
+    /// subscriber can be disconnected and still resume via
+    /// `Last-Event-ID`/`start_id` without hitting the `gap` fallback — see
+    /// "How long can a client be disconnected?" in `docs/stream-events.md`
+    /// for the wall-clock formula (retention window ≈ maxlen / events-per-second).
     pub redis_stream_maxlen: u64,
     pub metrics_port: u16,
     pub health_port: u16,

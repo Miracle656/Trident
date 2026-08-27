@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
+	"encoding/base32"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -52,7 +53,7 @@ func TestStreamIntegration(t *testing.T) {
 	defer server.Close()
 
 	t.Run("forwards three events with SSE headers", func(t *testing.T) {
-		contractID := fmt.Sprintf("C-INTEGRATION-%d", time.Now().UnixNano())
+		contractID := newTestContractID("integration")
 		response, stop := connectSSE(t, server.URL, apiKey, contractID, "")
 		defer stop()
 
@@ -84,7 +85,7 @@ func TestStreamIntegration(t *testing.T) {
 	})
 
 	t.Run("filters topic0", func(t *testing.T) {
-		contractID := fmt.Sprintf("C-FILTER-%d", time.Now().UnixNano())
+		contractID := newTestContractID("filter")
 		response, stop := connectSSE(t, server.URL, apiKey, contractID, "wanted")
 		defer stop()
 
@@ -174,6 +175,21 @@ func readSSEEvent(t *testing.T, scanner *bufio.Scanner) map[string]any {
 func stringField(event map[string]any, field string) string {
 	value, _ := event[field].(string)
 	return value
+}
+
+// testContractID builds a unique value that satisfies validation's Stellar
+// strkey shape check (`^C[A-Z2-7]{55}$`) — a plain "C-<label>-<nanos>" string
+// used to fail that validation with a 400 before a real contract id was
+// required here. label lets tests keep distinguishable ids in logs; the
+// current timestamp keeps concurrent subtests/goroutines from colliding on
+// the same stream key.
+func newTestContractID(label string) string {
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%s-%d", label, time.Now().UnixNano())))
+	body := strings.TrimRight(base32.StdEncoding.EncodeToString(sum[:]), "=")
+	for len(body) < 55 {
+		body += "A"
+	}
+	return "C" + body[:55]
 }
 
 func integrationHashKey(salt, key string) string {

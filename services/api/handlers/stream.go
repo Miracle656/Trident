@@ -32,7 +32,7 @@ type streamRedisClient interface {
 
 // eventStreamGapEvent is the documented SSE event sent when a requested
 // Last-Event-ID is older than the stream retention window.
-const eventStreamGapEvent = `event: gap\ndata: {"message":"requested Last-Event-ID is outside the retention window; resuming from oldest available"}\n\n`
+const eventStreamGapEvent = "event: gap\ndata: {\"message\":\"requested Last-Event-ID is outside the retention window; resuming from oldest available\"}\n\n"
 
 // Stream returns an SSE handler that forwards new Redis Stream events for one
 // contract. The handler owns the blocking read loop, so request cancellation
@@ -65,19 +65,21 @@ func Stream(rdb streamRedisClient) http.HandlerFunc {
 
 		// Honour Last-Event-ID for resumption (issue #235).
 		// If the header is present and non-empty, try to resume from that point.
+		//
+		// Resolution happens entirely before any bytes are written to w: the
+		// SSE response headers (Content-Type, Cache-Control, ...) must be the
+		// first thing sent, otherwise Go's http server implicitly sends a
+		// 200 with default headers on the first Write and the explicit
+		// WriteHeader below becomes a no-op — a client (or a `gap`-triggering
+		// resume in particular) would then never see Content-Type:
+		// text/event-stream.
 		lastID := ""
+		emitGap := false
 		if lastEventID := r.Header.Get("Last-Event-ID"); lastEventID != "" {
 			// Verify the requested id exists in the stream. If not, emit a gap
 			// signal and resume from the oldest available.
 			msgs, lookupErr := rdb.XRevRangeN(r.Context(), eventStreamKey, lastEventID, lastEventID, 1).Result()
 			if lookupErr != nil || len(msgs) == 0 {
-				// Emit a gap event so the client knows data was lost.
-				if _, writeErr := fmt.Fprint(w, eventStreamGapEvent); writeErr != nil {
-					slog.Warn("sse: write failed, disconnecting slow consumer", "contractId", contractID, "err", writeErr)
-					return
-				}
-				_ = rc.Flush()
-
 				oldest, err := earliestStreamID(r.Context(), rdb)
 				if err != nil {
 					if r.Context().Err() != nil {
@@ -88,6 +90,7 @@ func Stream(rdb streamRedisClient) http.HandlerFunc {
 					return
 				}
 				lastID = oldest
+				emitGap = true
 			} else {
 				lastID = lastEventID
 			}
@@ -115,6 +118,19 @@ func Stream(rdb streamRedisClient) http.HandlerFunc {
 		if err := rc.Flush(); err != nil {
 			slog.Warn("sse: response writer cannot flush", "err", err)
 			return
+		}
+
+		if emitGap {
+			// Emit a gap event so the client knows data was lost, now that
+			// the SSE headers are already on the wire.
+			if _, writeErr := fmt.Fprint(w, eventStreamGapEvent); writeErr != nil {
+				slog.Warn("sse: write failed, disconnecting slow consumer", "contractId", contractID, "err", writeErr)
+				return
+			}
+			if err := rc.Flush(); err != nil {
+				slog.Warn("sse: response writer cannot flush", "err", err)
+				return
+			}
 		}
 
 		topic0 := q.Get("topic0")

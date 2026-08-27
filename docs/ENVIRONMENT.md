@@ -53,7 +53,7 @@ description is accurate. Keep this file honest by hand.
 | `INDEX_TOPIC_FILTERS` | Optional | none (no narrowing) | Comma-separated topic patterns pushed into the RPC filter alongside the contract allowlist. |
 | `INDEX_DIAGNOSTIC` | Optional | `false` | Store Soroban diagnostic events (high-volume; keep `false` in production). |
 | `TRACKED_SAC_ASSETS` | Optional | none | Assets to derive SAC contract ids for and track. |
-| `REDIS_STREAM_MAXLEN` | Optional | `10000` | Max events kept in the Redis stream before trimming. |
+| `REDIS_STREAM_MAXLEN` | Optional | `10000` | Max events kept in the Redis stream before trimming. This is a count, not a duration — see "How long can a client be disconnected?" in [`docs/stream-events.md`](./stream-events.md) to convert it to a wall-clock retention window. |
 | `METRICS_PORT` | Optional | `9090` | Prometheus `/metrics` port; also doubles as the indexer's liveness/readiness signal. |
 | `HEALTH_PORT` | Optional | `8080` | Port serving `/healthz` and `/readyz`. |
 | `RUST_LOG` | Optional | `info` | Log verbosity (`error`\|`warn`\|`info`\|`debug`\|`trace`). |

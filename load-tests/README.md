@@ -33,6 +33,20 @@ scripts to match rather than the other way around.
 | `batch-load.js` | `POST /v1/events/batch` | `BASE_URL=http://localhost:3000 API_KEY=<key> k6 run load-tests/batch-load.js` |
 | `stats-load.js` | `GET /v1/stats/indexer`, `GET /v1/stats/contracts` | `BASE_URL=http://localhost:3000 API_KEY=<key> k6 run load-tests/stats-load.js` |
 | `stream-load.js` | `GET /v1/events/stream` (SSE) — connect-and-hold under concurrency | `BASE_URL=http://localhost:3000 API_KEY=<key> CONCURRENT_STREAMS=20 HOLD_SECONDS=30 k6 run load-tests/stream-load.js` |
+
+`stream-load.js` only proves the server accepts many concurrent long-lived
+connections (see its header comment) — it cannot assert per-client event
+content with k6's HTTP client. The reconnect-storm correctness check for
+issue #428 (many clients disconnecting and reconnecting with valid
+`Last-Event-ID`s at once, with an assertion that none of them lose or
+duplicate an event) lives as a Go test instead, where content assertions are
+straightforward:
+`TestStream_ReconnectStormNoEventLoss` in
+[`services/api/handlers/stream_reconnect_test.go`](../services/api/handlers/stream_reconnect_test.go)
+(`TEST_REDIS_URL=<redis-url> go test ./services/api/handlers/... -run TestStream_ReconnectStormNoEventLoss -v`).
+That file also covers the other issue #428 resume scenarios: a mid-stream
+disconnect/reconnect, resuming from an id older than the retention window
+(the `gap` event), and a simulated API-process restart.
 | `rate-limit-concurrency.js` | One-key burst proving the tier limit holds under launch-scale concurrency | `BASE_URL=http://localhost:3000 API_KEY=<key> EXPECTED_LIMIT=100 CONCURRENT_REQUESTS=1000 k6 run load-tests/rate-limit-concurrency.js` |
 | `ingest-soak.sh` | Sustained ingest volume (contract mint loop) + Go API / Rust indexer resource sampling over time | `LOCAL_RPC_URL=http://localhost:8000/rpc SOAK_DURATION_SECONDS=1800 ./load-tests/ingest-soak.sh` |
 
