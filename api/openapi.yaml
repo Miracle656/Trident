@@ -28,6 +28,29 @@ info:
     - `network` — `testnet` or `mainnet`.
     - Unknown query parameters are rejected, so a typo such as `?limitt=5`
       fails loudly instead of silently changing the page size.
+
+    ## Pagination
+
+    Every list endpoint returns the same keyset-pagination envelope: the item
+    array, `has_more`, and `next_cursor`.
+
+    `next_cursor` is **always present** in the response object. When there is
+    no further page it is the explicit JSON value `null` — it is never omitted:
+
+    ```json
+    {"contracts": [], "has_more": false, "next_cursor": null}
+    ```
+
+    This is the normative wire form for every list endpoint. Explicit `null`
+    is used rather than an omitted key because the two are not equivalent to a
+    strictly-typed client: an omitted key cannot be distinguished from a server
+    too old to send the field, whereas `null` unambiguously means "no next
+    page". Fixing the representation across all list endpoints is what lets an
+    SDK auto-pager loop on one rule — *stop when `next_cursor` is `null`* —
+    with no per-endpoint special-casing.
+
+    Treat the cursor as opaque: pass back exactly the value you received, and
+    never construct or parse one.
   version: 1.0.0
   contact:
     name: Trident Team
@@ -405,8 +428,12 @@ paths:
           description: Soroban contract address
       responses:
         "200":
-          description: Contract event schema registry entry
+          description: >-
+            Contract event schema registry entry. Cached for 5 minutes
+            (issue #221) — see X-Cache.
           headers:
+            X-Cache:
+              $ref: "#/components/headers/X-Cache"
             X-RateLimit-Limit:
               $ref: "#/components/headers/X-RateLimit-Limit"
             X-RateLimit-Remaining:
@@ -443,8 +470,12 @@ paths:
           description: Soroban contract address
       responses:
         "200":
-          description: Contract spec and detected interfaces
+          description: >-
+            Contract spec and detected interfaces. Cached for 5 minutes
+            (issue #221) — see X-Cache.
           headers:
+            X-Cache:
+              $ref: "#/components/headers/X-Cache"
             X-RateLimit-Limit:
               $ref: "#/components/headers/X-RateLimit-Limit"
             X-RateLimit-Remaining:
@@ -525,6 +556,19 @@ paths:
           schema:
             type: string
           description: Storage key to fetch history for, as returned by the storage/spec endpoints
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 50
+          description: Maximum number of history entries to return
+        - name: cursor
+          in: query
+          schema:
+            type: string
+          description: Opaque pagination cursor from previous response's next_cursor (for next page)
       responses:
         "200":
           description: Recorded changes for the requested storage key
@@ -538,7 +582,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ContractStorageResponse"
+                $ref: "#/components/schemas/ContractStorageHistoryResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -607,6 +651,11 @@ paths:
             maximum: 100
             default: 50
           description: Number of top contracts to return
+        - name: cursor
+          in: query
+          schema:
+            type: string
+          description: Opaque pagination cursor from previous response's next_cursor (for next page)
       responses:
         "200":
           description: >-
@@ -644,6 +693,8 @@ paths:
         - API Keys
       security:
         - AdminKey: []
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
       requestBody:
         required: true
         content:
@@ -667,6 +718,9 @@ paths:
       responses:
         "201":
           description: API key created
+          headers:
+            Idempotent-Replayed:
+              $ref: "#/components/headers/Idempotent-Replayed"
           content:
             application/json:
               schema:
@@ -675,31 +729,47 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "409":
+          $ref: "#/components/responses/Conflict"
         "429":
           $ref: "#/components/responses/TooManyRequestsIPOnly"
 
     get:
       summary: List API keys
-      description: List all API keys (admin only)
+      description: >-
+        List API keys (admin only), keyset-paginated (issue #220). Ordered
+        newest first (created_at DESC, id DESC as tiebreaker); cursor is
+        opaque — never construct or parse it, just pass back the value
+        returned in next_cursor.
       operationId: listApiKeys
       tags:
         - API Keys
       security:
         - AdminKey: []
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 50
+        - name: cursor
+          in: query
+          required: false
+          description: Opaque pagination cursor from a previous response's next_cursor.
+          schema:
+            type: string
       responses:
         "200":
-          description: List of API keys
+          description: Page of API keys
           content:
             application/json:
               schema:
-                type: object
-                additionalProperties: false
-                required: [api_keys]
-                properties:
-                  api_keys:
-                    type: array
-                    items:
-                      $ref: "#/components/schemas/APIKeyResponse"
+                $ref: "#/components/schemas/ListAPIKeysResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "429":
@@ -1206,6 +1276,37 @@ components:
             $ref: "#/components/schemas/ContractStorageValue"
           description: Storage snapshot values (latest, or full history when queried via /storage/history)
 
+    ContractStorageHistoryResponse:
+      type: object
+      required:
+        - contract_id
+        - network
+        - storage_key
+        - values
+        - has_more
+      properties:
+        contract_id:
+          type: string
+          description: The contract whose storage history was queried
+        network:
+          type: string
+          description: Network the contract is indexed on
+        storage_key:
+          type: string
+          description: The storage key whose history was queried
+        values:
+          type: array
+          items:
+            $ref: "#/components/schemas/ContractStorageValue"
+          description: Storage history entries, oldest first
+        has_more:
+          type: boolean
+          description: Whether more pages are available
+        next_cursor:
+          type: string
+          nullable: true
+          description: Opaque cursor to pass as the cursor parameter for the next page
+
     ContractStorageValue:
       type: object
       additionalProperties: false
@@ -1241,6 +1342,7 @@ components:
         - to_ledger
         - network
         - generated_at
+        - has_more
       properties:
         contracts:
           type: array
@@ -1263,6 +1365,13 @@ components:
           type: string
           format: date-time
           description: Timestamp when response was generated
+        has_more:
+          type: boolean
+          description: Whether more pages are available
+        next_cursor:
+          type: string
+          nullable: true
+          description: Opaque cursor to pass as the cursor parameter for the next page
 
     ContractStats:
       type: object
@@ -1365,6 +1474,75 @@ components:
           type: string
           format: date-time
 
+    ListAPIKeysResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - api_keys
+        - has_more
+        - next_cursor
+      properties:
+        api_keys:
+          type: array
+          items:
+            $ref: "#/components/schemas/APIKeyResponse"
+        has_more:
+          type: boolean
+          description: Whether another page is available.
+        next_cursor:
+          type: string
+          nullable: true
+          description: Opaque cursor for the next page (null if has_more is false).
+
+    ListContractsResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - contracts
+        - has_more
+        - next_cursor
+      properties:
+        contracts:
+          type: array
+          items:
+            $ref: "#/components/schemas/ContractResponse"
+        has_more:
+          type: boolean
+          description: Whether another page is available.
+        next_cursor:
+          type: string
+          nullable: true
+          description: Opaque cursor for the next page (null if has_more is false).
+
+    ContractResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - contract_id
+        - index_from
+        - created_at
+      properties:
+        id:
+          type: string
+          format: uuid
+        contract_id:
+          type: string
+          description: Stellar contract id (C... strkey).
+        network:
+          type: string
+          nullable: true
+        label:
+          type: string
+          nullable: true
+        index_from:
+          type: integer
+          format: int64
+          description: Ledger sequence indexing began from.
+        created_at:
+          type: string
+          format: date-time
+
     ErrorResponse:
       type: object
       additionalProperties: false
@@ -1380,7 +1558,7 @@ components:
           properties:
             code:
               type: string
-              description: Error code (e.g., INVALID_ARGUMENT, INTERNAL, UNAVAILABLE)
+              description: Error code (e.g., INVALID_ARGUMENT, INTERNAL, UNAVAILABLE, CONFLICT)
             message:
               type: string
               description: Human-readable error message
@@ -1441,6 +1619,17 @@ components:
         type: string
         enum: [HIT, MISS]
       example: HIT
+
+    Idempotent-Replayed:
+      description: >-
+        Present and set to "true" only when this response was replayed from
+        a prior request carrying the same Idempotency-Key (issue #225).
+        Absent on the original (first) execution.
+      required: false
+      schema:
+        type: string
+        enum: ["true"]
+      example: "true"
 
   responses:
     BadRequest:
@@ -1510,6 +1699,34 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/ErrorResponse"
+
+    Conflict:
+      description: >-
+        The supplied Idempotency-Key was already used with a request that
+        does not match this one (error.code CONFLICT). Retry with a new key,
+        or resend the exact original request body to get the original
+        response replayed instead (issue #225).
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: >-
+        Opt-in de-duplication for retried create requests (issue #225). A
+        retry carrying the same key and an identical request body replays
+        the original response (see the `Idempotent-Replayed: true` response
+        header) instead of creating a second resource. The same key reused
+        with a different body is rejected with 409 Conflict. Keys are
+        remembered for 24 hours; max length 255 characters.
+      schema:
+        type: string
+        maxLength: 255
+      example: 7da8f2b1-2e3c-4b8a-9f0d-6a1e5c3d9b7f
 
   securitySchemes:
     ApiKeyAuth:

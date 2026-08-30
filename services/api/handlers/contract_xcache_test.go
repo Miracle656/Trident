@@ -107,8 +107,8 @@ func TestContractsStats_XCache_Hit(t *testing.T) {
 	rdb := newMiniredisClient(t)
 	req := contractsStatsExplicitRangeReq(t)
 
-	cacheKey := "stats:contracts:testnet:0:1000000:10"
-	cachedBody := `{"contracts":[],"from_ledger":0,"to_ledger":1000000,"network":"testnet","generated_at":"` +
+	cacheKey := "stats:contracts:testnet:0:1000000:10:"
+	cachedBody := `{"contracts":[],"from_ledger":0,"to_ledger":1000000,"network":"testnet","has_more":false,"next_cursor":null,"generated_at":"` +
 		time.Now().UTC().Format(time.RFC3339) + `"}`
 	if err := rdb.Set(context.Background(), cacheKey, cachedBody, time.Minute).Err(); err != nil {
 		t.Fatalf("seed cache: %v", err)

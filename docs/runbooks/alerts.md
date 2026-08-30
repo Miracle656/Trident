@@ -6,6 +6,11 @@ the first steps to take when it fires. See
 [`docs/metrics-catalog.md`](../metrics-catalog.md) for what every metric
 referenced here actually measures.
 
+**Related runbooks:**
+- [`incident-response.md`](incident-response.md) — severity classification (SEV-1/2/3), on-call owner, escalation path, and user communication channel.
+- [`alert-routing.md`](alert-routing.md) — Alertmanager configuration, pre-launch routing test checklist, and maintenance silences.
+- [`post-incident-review.md`](post-incident-review.md) — PIR template; complete within 72 hours of resolving any SEV-1 or SEV-2 incident.
+
 ## TridentIndexerLagWarning
 
 **Means:** the indexer is more than 200 ledgers behind the Stellar chain tip,
@@ -222,6 +227,133 @@ absorbs on its own.
 3. As a mitigation, `GO_API_DB_POOL_SIZE` can be raised without a code
    change, but treat it as a stopgap if the root cause is a query regression.
 
+
+---
+
+## TridentDiskSpaceLow
+
+**Means:** less than 15% of the Postgres data volume remains, regardless of trend.
+
+**Why this threshold:** the two predictive alerts above extrapolate a 6-hour trend, which cannot see a step change — a large backfill, a WAL pileup behind a stalled replication slot, or a runaway temp file. This is the backstop for those, so it fires on the level rather than the slope.
+
+**First steps:**
+1. Identify the consumer: `pg_ls_waldir()` for WAL,
+   `pg_stat_replication` / `pg_replication_slots` for a stalled slot, and the
+   table-size query above for ordinary growth.
+2. A stalled replication slot is the most common non-obvious cause — an
+   inactive slot pins WAL indefinitely. Drop it if the replica is genuinely
+   gone: `SELECT pg_drop_replication_slot('<name>');`
+3. If it is ordinary growth, treat it as
+   `TridentDiskFillingWithin48Hours` above.
+
+---
+
+## TridentPartitionExhaustionWarning
+
+**Means:** `trident_indexer_partition_lookahead_ledgers` — the distance in
+ledgers between the current ingest cursor and the upper bound of the last named
+`soroban_events` partition — has been below 5,000,000 for 30 minutes.
+
+**Why this threshold:** at Stellar's current rate of ~17,280 ledgers/day,
+5,000,000 ledgers is ~289 days of runway. That is intentionally generous: adding
+a partition is a single SQL call but requires operator attention, and the
+indexer will halt entirely (Fatal error, see below) if the boundary is actually
+reached. This warning fires while there is still months of time to act, not
+days.
+
+**First steps:**
+1. Confirm the current boundary — query the DB directly:
+   ```sql
+   SELECT MAX(
+       (regexp_match(
+           pg_get_partition_constraintdef(child.oid),
+           'ledger_sequence < (\d+)'
+       ))[1]::bigint
+   )
+   FROM pg_inherits
+   JOIN pg_class parent ON parent.oid = inhparent
+   JOIN pg_class child  ON child.oid  = inhrelid
+   WHERE parent.relname = 'soroban_events';
+   ```
+2. Add the next partition. Each partition covers 2,000,000 ledgers; extend
+   from the current upper bound:
+   ```sql
+   SELECT create_soroban_partition(60000000, 62000000);
+   -- then the next one:
+   SELECT create_soroban_partition(62000000, 64000000);
+   ```
+   The `create_soroban_partition` function (defined in migration
+   `0017_soroban_events_partitioning.sql`) is idempotent — calling it for
+   a range that already exists returns `'already exists: ...'` without error.
+3. Verify the metric drops back to a safe value on the next poll cycle
+   (within the indexer's configured poll interval after the partition is
+   created).
+
+**Why it fires as a warning, not a page:** there is months of runway at the
+5M threshold. Create a ticket, action it during business hours, and monitor
+the gauge. Escalate to `TridentPartitionExhausted` (critical) if the lookahead
+continues to fall without action.
+
+## TridentPartitionExhausted
+
+**Means:** `trident_indexer_partition_lookahead_ledgers` is at or below 0 —
+the ingest cursor has reached or passed the upper bound of the last named
+`soroban_events` partition. The indexer will refuse to commit any further pages
+and will halt with a `Fatal` error on the next poll cycle that produces events.
+
+**Why this threshold:** a `<= 0` lookahead means the very next INSERT would
+land in `soroban_events_default` — the unindexed, unmanaged DEFAULT catch-all
+partition. Silently writing there would make data invisible to API queries and
+unrecoverable by normal partition retention tools. The indexer halts rather
+than corrupt the event stream (see `assert_no_default_partition_overflow` in
+`crates/indexer/src/db/mod.rs`).
+
+**This is a total ingest outage.** Treat as SEV-1. Resolve before resuming.
+
+**First steps:**
+1. **Add the next partition immediately.** Get the exact boundary value:
+   ```sql
+   SELECT MAX(
+       (regexp_match(
+           pg_get_partition_constraintdef(child.oid),
+           'ledger_sequence < (\d+)'
+       ))[1]::bigint
+   ) AS last_upper
+   FROM pg_inherits
+   JOIN pg_class parent ON parent.oid = inhparent
+   JOIN pg_class child  ON child.oid  = inhrelid
+   WHERE parent.relname = 'soroban_events';
+   ```
+   Then create the next two partitions (add a buffer, not just one):
+   ```sql
+   SELECT create_soroban_partition(<last_upper>, <last_upper + 2000000>);
+   SELECT create_soroban_partition(<last_upper + 2000000>, <last_upper + 4000000>);
+   ```
+2. **Verify the partition was created:**
+   ```sql
+   SELECT relname FROM pg_class
+   WHERE relname LIKE 'soroban_events_p%'
+   ORDER BY relname DESC LIMIT 5;
+   ```
+3. **Restart the indexer** (it halted with a Fatal error; it will not recover
+   on its own). The cursor is persisted in `system_state` so restart resumes
+   from exactly where it stopped — no data loss, no re-index required.
+4. **Confirm** `trident_indexer_partition_lookahead_ledgers` is positive and
+   rising after the restart.
+5. Check whether any events landed in `soroban_events_default` during any
+   window when the guard was not in effect (pre-#525). If rows exist there,
+   they must be migrated into the correct named partition:
+   ```sql
+   -- Inspect what is in the default partition
+   SELECT MIN(ledger_sequence), MAX(ledger_sequence), COUNT(*)
+   FROM soroban_events_default;
+   -- If rows exist and the correct named partition now covers the range,
+   -- move them:
+   INSERT INTO soroban_events
+   SELECT * FROM soroban_events_default
+   ON CONFLICT DO NOTHING;
+   DELETE FROM soroban_events_default;
+   ```
 
 ---
 

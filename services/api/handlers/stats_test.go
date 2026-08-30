@@ -311,7 +311,7 @@ func TestContractStatsRollup_MatchesLiveAggregation(t *testing.T) {
 		t.Fatalf("rollup should be populated for network %q after refresh", network)
 	}
 
-	liveStats, err := queryContractStats(ctx, pool, params)
+	liveStats, err := queryContractStats(ctx, pool, params, nil)
 	if err != nil {
 		t.Fatalf("live query: %v", err)
 	}

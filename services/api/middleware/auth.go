@@ -87,6 +87,10 @@ func withAuthenticatedKey(ctx context.Context, idStr, network string) context.Co
 	if id, err := uuid.Parse(idStr); err == nil {
 		ctx = WithAuditAPIKeyID(ctx, &id)
 	}
+	// Also surfaces on StructuredLogging's end-of-request log line (issue
+	// #239) — see requestLogState for why this can't just be another
+	// context.WithValue.
+	SetLogAPIKeyID(ctx, idStr)
 	return ctx
 }
 

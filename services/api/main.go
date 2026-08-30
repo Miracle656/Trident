@@ -196,6 +196,11 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	go ws.StartConsumer(ctx, redisClient, hub)
+	// Best-effort cache invalidation (issue #221): bumps a contract's cache
+	// version the moment a new event for it arrives, so ResponseCache-wrapped
+	// endpoints (contract spec/schema below) stop serving stale responses
+	// immediately rather than waiting out their TTL.
+	go middleware.StartCacheInvalidator(ctx, redisClient, ws.StreamKey)
 
 	// Start API-key usage tracker (issue #139). Flushes request_count /
 	// last_used_at to postgres in batches every 5s so auth never blocks.
@@ -299,14 +304,25 @@ func main() {
 	mux.HandleFunc("POST /v1/admin/contracts", handlers.CreateContract(contractCfg))
 	mux.HandleFunc("GET /v1/admin/contracts", handlers.ListContracts(contractCfg))
 	mux.HandleFunc("DELETE /v1/admin/contracts/{id}", handlers.DeleteContract(contractCfg))
-	// API key management (admin-only via X-Admin-Key header)
-	mux.HandleFunc("POST /v1/api-keys", handlers.CreateAPIKey(apiKeyCfg))
+	// API key management (admin-only via X-Admin-Key header). Idempotency
+	// wraps only the create route (issue #225): a retried creation with the
+	// same Idempotency-Key + body replays the original response instead of
+	// minting a second key.
+	mux.Handle("POST /v1/api-keys", middleware.Idempotency(redisClient, middleware.DefaultIdempotencyTTL)(handlers.CreateAPIKey(apiKeyCfg)))
 	mux.HandleFunc("GET /v1/api-keys", handlers.ListAPIKeys(apiKeyCfg))
 	mux.HandleFunc("PATCH /v1/api-keys/{id}", handlers.UpdateAPIKey(apiKeyCfg))
 	mux.HandleFunc("DELETE /v1/api-keys/{id}", handlers.DeleteAPIKey(apiKeyCfg))
 	mux.HandleFunc("GET /v1/stats/indexer", handlers.IndexerStats(healthDB))
-	mux.HandleFunc("GET /v1/contracts/{id}/events/schema", handlers.ContractEventSchemas(schemaRegistryDB))
-	mux.HandleFunc("GET /v1/contracts/{id}/spec", handlers.ContractSpec(schemaRegistryDB))
+	// Contract spec/schema change only when a contract is redeployed — rare,
+	// read-only, no side effects — so they're cached (issue #221) with a
+	// TTL well above the 60s used for stats/contracts below, and are
+	// invalidated immediately on a new event for that contract rather than
+	// waiting out the TTL (see StartCacheInvalidator).
+	const contractMetadataCacheTTL = 5 * time.Minute
+	mux.Handle("GET /v1/contracts/{id}/events/schema",
+		middleware.ResponseCache(redisClient, contractMetadataCacheTTL, middleware.DefaultCacheKey)(handlers.ContractEventSchemas(schemaRegistryDB)))
+	mux.Handle("GET /v1/contracts/{id}/spec",
+		middleware.ResponseCache(redisClient, contractMetadataCacheTTL, middleware.DefaultCacheKey)(handlers.ContractSpec(schemaRegistryDB)))
 	mux.HandleFunc("GET /v1/contracts/{id}/storage", handlers.ContractStorageLatest(schemaRegistryDB))
 	mux.HandleFunc("GET /v1/contracts/{id}/storage/history", handlers.ContractStorageHistory(schemaRegistryDB))
 	mux.HandleFunc("GET /v1/stats/contracts", handlers.ContractsStats(pool, redisClient))
@@ -319,18 +335,20 @@ func main() {
 	}
 	mux.HandleFunc("POST /v1/contracts/{id}/call", handlers.CallContract(sorobanCaller))
 	mux.HandleFunc("GET /v1/webhooks", listWebhooksHandler(webhookDB))
-	mux.HandleFunc("POST /v1/webhooks", createWebhookHandler(webhookDB))
+	// Idempotency (issue #225): a retried subscription creation with the same
+	// Idempotency-Key + body replays the original response instead of
+	// creating a second subscription (and a second webhook secret).
+	mux.Handle("POST /v1/webhooks", middleware.Idempotency(redisClient, middleware.DefaultIdempotencyTTL)(createWebhookHandler(webhookDB)))
 	mux.HandleFunc("DELETE /v1/webhooks/{id}", deleteWebhookHandler(webhookDB))
 	mux.HandleFunc("PATCH /v1/webhooks/{id}/pause", pauseWebhookHandler(webhookDB))
 	mux.HandleFunc("PATCH /v1/webhooks/{id}/resume", resumeWebhookHandler(webhookDB))
 	mux.HandleFunc("GET /v1/webhooks/{id}/deliveries", deliveriesWebhookHandler(webhookDB))
 	mux.HandleFunc("GET /v1/webhooks/{id}/dead-letters", deadLettersWebhookHandler(webhookDB))
 	mux.HandleFunc("POST /v1/webhooks/{id}/dead-letters/{deliveryId}/replay", replayDeadLetterHandler(webhookDB))
+	mux.HandleFunc("POST /v1/webhooks/{id}/rotate-secret", rotateWebhookSecretHandler(webhookDB))
 	mux.HandleFunc("GET /metrics", handlers.MetricsHandler(pool, redisClient))
 	mux.HandleFunc("GET /internal/status", handlers.InternalStatus())
 	mux.Handle("/ws", middleware.WSConnectionLimit(ws.Handler(hub)))
-	keyValidator := middleware.Validator(middleware.ParseKeyHashes(os.Getenv("API_KEY_HASHES")))
-	mux.Handle("/graphql", middleware.WSConnectionLimit(ws.GraphQLHandler(hub, keyValidator)))
 
 	_ = usageTrack // passed to middleware in future; declared for shutdown ordering
 
@@ -346,6 +364,21 @@ func main() {
 		authDB.DB = pool
 	}
 	authDB.Redis = redisClient
+
+	// GraphQL/WS is registered after rlCfg and authDB exist because it must
+	// reuse them (issue #223). The HTTP middlewares cannot cover this
+	// endpoint on their own: NewDBAuth skips any path that is neither /v1/*
+	// nor /ws, and TieredRateLimit keys off the X-API-Key header, which a
+	// WebSocket client never sends — it authenticates in the connection_init
+	// payload instead. Passing the same auth config and rate-limit config in
+	// here gives GraphQL the same api_keys lookup and the same per-key
+	// sliding window REST gets, rather than the legacy env-var key set and no
+	// limit at all.
+	mux.Handle("/graphql", middleware.WSConnectionLimit(ws.GraphQLHandler(hub, ws.GraphQLDeps{
+		Auth:        middleware.GraphQLDBAuth(authDB),
+		RateLimiter: middleware.GraphQLRateLimiter(rlCfg),
+		Backend:     handlers.NewGraphQLBackend(pool),
+	})))
 
 	handler := middleware.NewBodySizeLimitFromEnv()(mux)
 	handler = middleware.TieredRateLimit(rlCfg)(handler)
@@ -367,7 +400,7 @@ func main() {
 	// X-Request-ID, and is captured in structured logs (issue #226). RequestID
 	// must precede StructuredLogging so the id is in context when the log line
 	// is emitted.
-	handler = middleware.Chain(handler, middleware.RequestID, middleware.StructuredLogging)
+	handler = middleware.Chain(handler, middleware.RequestID, middleware.StructuredLogging(mux))
 	// Global concurrency cap is the outermost middleware of all (issue #318):
 	// it must shed load before any other work — auth lookups, rate-limit
 	// Redis calls, logging — is spent on a request that's going to be

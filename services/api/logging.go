@@ -34,7 +34,12 @@ func initLogger() {
 		handler = slog.NewTextHandler(os.Stdout, opts)
 	}
 
-	slog.SetDefault(slog.New(handler))
+	// "service" is a base attribute on the logger itself, not something each
+	// call site has to remember to add (issue #239) — so it appears on every
+	// line, including ones StructuredLogging never sees (a slog.Error inside
+	// a handler, a background job, a websocket debug log), not just the
+	// per-request summary line.
+	slog.SetDefault(slog.New(handler).With(slog.String("service", "trident-api")))
 }
 
 func parseLogLevel(s string) (slog.Level, error) {

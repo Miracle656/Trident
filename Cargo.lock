@@ -4089,14 +4089,17 @@ dependencies = [
 
 [[package]]
 name = "trident-sdk"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "futures",
+ "hex",
+ "hmac",
  "mockito",
  "rand 0.8.6",
  "reqwest",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 1.0.69",
  "tokio",
  "tokio-test",

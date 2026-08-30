@@ -336,3 +336,66 @@ groups:
             fires regardless of trend, so it also catches a sudden step in
             usage such as a backfill or a WAL pileup.
           runbook_url: "docs/runbooks/alerts.md#tridentdiskspacelow"
+
+  # ---------------------------------------------------------------------------
+  # Partition coverage — soroban_events named partitions (issue #525).
+  #
+  # soroban_events is RANGE-partitioned by ledger_sequence. Named partitions
+  # must be pre-created ahead of the ingest frontier; when they run out every
+  # new row silently falls into soroban_events_default (the catch-all DEFAULT
+  # partition), which has no indexes and no retention tooling.
+  #
+  # The indexer exposes trident_indexer_partition_lookahead_ledgers: the
+  # distance in ledgers between the current cursor and the upper bound of the
+  # last named partition. When it reaches 0 the indexer halts with a Fatal
+  # error rather than writing to DEFAULT (see assert_no_default_partition_overflow
+  # in crates/indexer/src/db/mod.rs). These two alert tiers give lead time to
+  # act before that halt:
+  #
+  #   Warning  < 5_000_000 ledgers (~289 days at 17,280 ledgers/day)
+  #   Critical <= 0 ledgers  (overflow is imminent or already happening)
+  #
+  # To add the next partition:
+  #   SELECT create_soroban_partition(<last_upper>, <last_upper + 2000000>);
+  # See docs/runbooks/alerts.md#tridentpartitionexhaustionwarning for the full
+  # procedure and docs/deployment.md#staging for the partition strategy.
+  # ---------------------------------------------------------------------------
+  - name: trident.indexer.partitions
+    rules:
+      - alert: TridentPartitionExhaustionWarning
+        expr: trident_indexer_partition_lookahead_ledgers < 5000000
+        for: 30m
+        labels:
+          severity: warning
+          service: indexer
+        annotations:
+          summary: >-
+            soroban_events partition lookahead below 5M ledgers
+            ({{ $value | humanize }} remaining)
+          description: >
+            trident_indexer_partition_lookahead_ledgers has been below
+            5,000,000 for 30 minutes. At the current Stellar mainnet rate of
+            ~17,280 ledgers/day that is fewer than 289 days before the ingest
+            frontier reaches the last named partition boundary and the indexer
+            halts. Run `SELECT create_soroban_partition(<last_upper>,
+            <last_upper + 2000000>);` to extend the partition table before
+            that deadline.
+          runbook_url: "docs/runbooks/alerts.md#tridentpartitionexhaustionwarning"
+
+      - alert: TridentPartitionExhausted
+        expr: trident_indexer_partition_lookahead_ledgers <= 0
+        for: 5m
+        labels:
+          severity: critical
+          service: indexer
+        annotations:
+          summary: "soroban_events partition lookahead exhausted — indexer will halt"
+          description: >
+            trident_indexer_partition_lookahead_ledgers is at or below 0: the
+            ingest cursor has reached or passed the upper bound of the last
+            named soroban_events partition. The indexer will refuse to commit
+            any further pages and will halt with a Fatal error to prevent
+            silent writes to soroban_events_default. Add the next partition
+            immediately: `SELECT create_soroban_partition(<last_upper>,
+            <last_upper + 2000000>);` — see the runbook for the exact values.
+          runbook_url: "docs/runbooks/alerts.md#tridentpartitionexhausted"

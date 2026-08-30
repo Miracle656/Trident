@@ -21,6 +21,12 @@ export type { IterEventsOptions, QueryEventsFn } from "./iterator.js";
 export type { components, operations, paths } from "./api-types.gen.js";
 export { DEFAULT_RETRY_CONFIG } from "./retry.js";
 export type { RetryConfig } from "./retry.js";
+export {
+  computeSignature,
+  DEFAULT_TOLERANCE_SECONDS,
+  verifySignature,
+  WebhookVerificationError,
+} from "./webhook.js";
 
 // ---------------------------------------------------------------------------
 // Config

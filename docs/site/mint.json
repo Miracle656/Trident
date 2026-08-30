@@ -112,7 +112,8 @@
         "sdk/get-event-by-id",
         "sdk/subscribe",
         "sdk/errors",
-        "sdk/transport"
+        "sdk/transport",
+        "sdk/versioning"
       ]
     },
     {

@@ -123,6 +123,7 @@ description is accurate. Keep this file honest by hand.
 | `REDIS_STREAM_KEY` | Optional | `trident:events` | Redis stream key used for event pub/sub and webhook consumption; must match the indexer's stream. |
 | `WEBHOOK_CONSUMER_GROUP` | Optional | `trident-webhooks` | Redis Stream consumer-group name for the webhook delivery worker. |
 | `WEBHOOK_CONSUMER_NAME` | Optional | `webhook-worker` | Redis Stream consumer name for the webhook delivery worker. |
+| `WEBHOOK_SECRET_OVERLAP_HOURS` | Optional | `24` | Hours a rotated webhook secret stays valid after `POST /v1/webhooks/{id}/rotate-secret`. The hourly cleanup job clears `secondary_secret` once this window passes, so a rotated secret is actually revoked. Values that are non-positive or unparseable fall back to the default. |
 | `RATE_LIMIT_FREE_RPS` | Optional | `10` | Requests/sec limit, free tier. |
 | `RATE_LIMIT_PRO_RPS` | Optional | `100` | Requests/sec limit, pro/standard tier. |
 | `RATE_LIMIT_INTERNAL_RPS` | Optional | `1000` | Requests/sec limit, internal tier. |

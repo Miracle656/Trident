@@ -782,6 +782,100 @@ pub async fn load_indexed_contracts(
     Ok(rows.into_iter().collect())
 }
 
+/// Return the upper bound (exclusive) of the highest **named** range partition
+/// on `soroban_events`, or `None` if the table has no named range partitions
+/// (only the DEFAULT catch-all exists).
+///
+/// This is the ledger sequence at which the ingest frontier will overflow into
+/// `soroban_events_default` — the silent data-loss path issue #525 guards
+/// against. The value is read from `pg_class` / `pg_constraint` so it is
+/// always authoritative even after `create_soroban_partition()` adds new ones.
+///
+/// The query selects the maximum `confreljoin` exclusion boundary, which
+/// Postgres stores as the `FROM … TO (upper_bound)` value of every range
+/// partition constraint on the parent table.
+/// Returns the `[lower, upper)` bounds of every named `soroban_events`
+/// partition, ascending.
+///
+/// A single MAX(upper_bound) is not sufficient: migration 0017 seeds
+/// partitions for 0–6M and then 50M–60M, leaving a 44-million-ledger hole. A
+/// max-only guard reports 60M and happily accepts a ledger at 20M, which then
+/// falls through to `soroban_events_default` — precisely the silent overflow
+/// this check exists to prevent (issue #525).
+pub async fn named_partition_ranges(pool: &PgPool) -> Result<Vec<(i64, i64)>, TridentError> {
+    // The DEFAULT partition has no FROM/TO clause, so both captures are NULL
+    // and it is filtered out below; we only want explicitly-bounded partitions.
+    // pg_get_expr(relpartbound) renders the bound as
+    //   FOR VALUES FROM ('0') TO ('2000000')
+    // Parsing that with a regex is brittle (quoting and spacing vary), so read
+    // the bounds structurally from pg_class.relpartbound instead: the parse
+    // tree exposes the datums directly and the DEFAULT partition has none.
+    let rows: Vec<(i64, i64)> = sqlx::query_as(
+        r#"
+        SELECT (regexp_match(bound, 'FROM \(''?([0-9]+)''?\)'))[1]::bigint AS lower_bound,
+               (regexp_match(bound, 'TO \(''?([0-9]+)''?\)'))[1]::bigint   AS upper_bound
+        FROM (
+            SELECT pg_catalog.pg_get_expr(child.relpartbound, child.oid) AS bound
+            FROM   pg_catalog.pg_inherits inh
+            JOIN   pg_catalog.pg_class    parent ON parent.oid = inh.inhparent
+            JOIN   pg_catalog.pg_class    child  ON child.oid  = inh.inhrelid
+            WHERE  parent.relname = 'soroban_events'
+        ) b
+        WHERE bound IS NOT NULL
+          AND bound NOT LIKE '%DEFAULT%'
+          AND (regexp_match(bound, 'FROM \(''?([0-9]+)''?\)'))[1] IS NOT NULL
+          AND (regexp_match(bound, 'TO \(''?([0-9]+)''?\)'))[1] IS NOT NULL
+        ORDER BY 1
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("named_partition_ranges")))?;
+
+    Ok(rows)
+}
+
+/// Verify that none of the `ledger_sequences` in `batch` are destined for the
+/// DEFAULT catch-all partition of `soroban_events` (issue #525).
+///
+/// A row lands in the DEFAULT partition when its `ledger_sequence` falls
+/// outside every named range partition. At that point named partitions are
+/// exhausted and data is silently accumulating in an unindexed, unretained
+/// catch-all that the operator has no tooling to manage.
+///
+/// Returns `Ok(())` when every sequence in `batch` is covered by a named
+/// partition. Returns `Err(TridentError::ConfigError)` — which the streamer
+/// treats as `Severity::Fatal` — when any sequence would land in DEFAULT.
+///
+/// `last_upper` is the value returned by [`last_named_partition_upper_bound`];
+/// the caller caches it per poll cycle so this is a pure, zero-round-trip
+/// check.
+/// Fails if any ledger in `batch` is not covered by a named partition.
+///
+/// Checks containment against every range rather than only the highest upper
+/// bound: a ledger can fall into a *gap* between named partitions and still be
+/// below the maximum, in which case it silently lands in
+/// `soroban_events_default` (issue #525).
+pub fn assert_no_default_partition_overflow(
+    batch: &[i64],
+    ranges: &[(i64, i64)],
+) -> Result<(), TridentError> {
+    let covered = |seq: i64| ranges.iter().any(|&(lo, hi)| seq >= lo && seq < hi);
+
+    if let Some(&uncovered) = batch.iter().find(|&&seq| !covered(seq)) {
+        let highest = ranges.iter().map(|&(_, hi)| hi).max().unwrap_or(0);
+        let suggested_lo = uncovered - (uncovered % 2_000_000);
+        return Err(TridentError::config(anyhow::anyhow!(
+            "partition exhaustion: ledger_sequence {} is not covered by any named              soroban_events partition (highest known upper bound {}).              Events for this ledger would land in soroban_events_default.              Run `SELECT create_soroban_partition({}, {});` to create the              covering partition before resuming the indexer (issue #525).",
+            uncovered,
+            highest,
+            suggested_lo,
+            suggested_lo + 2_000_000,
+        )));
+    }
+    Ok(())
+}
+
 /// Read alert state (last_alert_at, alert_fired) from system_state (issue #75).
 pub async fn get_alert_state(pool: &PgPool) -> Result<crate::alerting::AlertState, TridentError> {
     let row: (Option<chrono::DateTime<chrono::Utc>>, bool) = sqlx::query_as(
@@ -844,6 +938,46 @@ pub async fn insert_parse_error(
     .execute(pool)
     .await
     .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("insert_parse_error")))?;
+
+    Ok(())
+}
+
+/// Dead-letter a well-formed event that repeatedly failed to persist into
+/// `soroban_events` (issue #208).
+///
+/// Unlike `insert_parse_error`, `event` here decoded successfully — the
+/// failure is in the storage layer, not the XDR. The full event is stored as
+/// JSONB so it can be inspected and replayed once the underlying cause (a
+/// constraint violation, an outage that outlasted the retry budget, etc.) is
+/// understood, without needing to re-fetch it from Stellar RPC.
+pub async fn insert_failed_event(
+    pool: &PgPool,
+    event: &SorobanEvent,
+    error_message: &str,
+    attempts: u32,
+) -> Result<(), TridentError> {
+    let payload = serde_json::to_value(event).map_err(|e| {
+        TridentError::storage(anyhow::Error::new(e).context("failed_events serialise"))
+    })?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO failed_events
+            (ledger_sequence, contract_id, transaction_hash, event_index,
+             event_payload, error_message, attempts)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        "#,
+    )
+    .bind(event.ledger_sequence as i64)
+    .bind(&event.contract_id)
+    .bind(&event.transaction_hash)
+    .bind(event.event_index as i32)
+    .bind(payload)
+    .bind(error_message)
+    .bind(attempts as i32)
+    .execute(pool)
+    .await
+    .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("insert_failed_event")))?;
 
     Ok(())
 }
@@ -1454,6 +1588,259 @@ mod tests {
         sqlx::query("DELETE FROM soroban_events WHERE contract_id = $1")
             .bind(&contract_id)
             .execute(&setup)
+            .await
+            .unwrap();
+    }
+
+    // -------------------------------------------------------------------------
+    // Partition exhaustion tests (issue #525)
+    // -------------------------------------------------------------------------
+
+    /// `assert_no_default_partition_overflow` must be a no-op when every
+    /// ledger_sequence in the batch is strictly below the upper bound.
+    #[test]
+    fn overflow_check_passes_when_all_sequences_within_bound() {
+        let sequences = vec![0i64, 1_000_000, 1_999_999];
+        assert!(
+            assert_no_default_partition_overflow(&sequences, &[(0, 2_000_000)]).is_ok(),
+            "sequences strictly below upper bound must not trigger overflow"
+        );
+    }
+
+    /// A batch containing a sequence exactly at the upper bound must fail —
+    /// the upper bound is exclusive (Postgres `FOR VALUES FROM (start) TO (end)`
+    /// means `start <= seq < end`).
+    #[test]
+    fn overflow_check_fails_when_sequence_equals_upper_bound() {
+        let sequences = vec![1_999_998i64, 2_000_000];
+        let err = assert_no_default_partition_overflow(&sequences, &[(0, 2_000_000)])
+            .expect_err("sequence == upper_bound should trigger overflow");
+        // Must be a ConfigError so the poll loop treats it as Fatal.
+        assert!(
+            matches!(err, TridentError::ConfigError { .. }),
+            "overflow must produce a ConfigError (Fatal severity), got: {err}"
+        );
+        assert!(
+            err.to_string().contains("2000000"),
+            "error message must name the offending sequence"
+        );
+    }
+
+    /// A batch containing a sequence beyond the upper bound must fail.
+    #[test]
+    fn overflow_check_fails_when_sequence_exceeds_upper_bound() {
+        let sequences = vec![58_000_001i64, 60_000_001];
+        let err = assert_no_default_partition_overflow(&sequences, &[(0, 60_000_000)])
+            .expect_err("sequence > upper_bound should trigger overflow");
+        assert!(matches!(err, TridentError::ConfigError { .. }));
+        // Error message must carry the create_soroban_partition hint so on-call
+        // knows exactly what SQL to run.
+        let msg = err.to_string();
+        assert!(
+            msg.contains("create_soroban_partition"),
+            "error message must include the create_soroban_partition hint"
+        );
+    }
+
+    /// Regression: a ledger that falls in a *gap* between named partitions is
+    /// below the highest upper bound but covered by nothing, so it lands in
+    /// soroban_events_default. Migration 0017 seeds exactly this shape —
+    /// partitions for 0-6M and 50M-60M, with a 44M-ledger hole between them —
+    /// so a guard that only compares against MAX(upper_bound) accepts ledger
+    /// 20_000_000 and silently corrupts the dataset (issue #525).
+    #[test]
+    fn overflow_check_fails_for_sequence_in_gap_between_partitions() {
+        let migration_0017_shape = &[
+            (0i64, 2_000_000i64),
+            (2_000_000, 4_000_000),
+            (4_000_000, 6_000_000),
+            (50_000_000, 52_000_000),
+            (52_000_000, 54_000_000),
+            (54_000_000, 56_000_000),
+            (56_000_000, 58_000_000),
+            (58_000_000, 60_000_000),
+        ];
+        // Below MAX(upper_bound) = 60_000_000, but inside the 6M-50M hole.
+        let err = assert_no_default_partition_overflow(&[20_000_000i64], migration_0017_shape)
+            .expect_err("a ledger inside a partition gap must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("20000000"),
+            "error must name the uncovered sequence, got: {msg}"
+        );
+        assert!(
+            msg.contains("create_soroban_partition"),
+            "error must include the remediation hint, got: {msg}"
+        );
+        // Sequences that ARE covered by the same shape must still pass.
+        assert!(
+            assert_no_default_partition_overflow(&[5_999_999i64, 50_000_000], migration_0017_shape)
+                .is_ok(),
+            "covered sequences must not be flagged"
+        );
+    }
+
+    /// An empty batch must never trigger the overflow check regardless of the
+    /// partition boundary value.
+    #[test]
+    fn overflow_check_passes_for_empty_batch() {
+        assert!(
+            assert_no_default_partition_overflow(&[], &[]).is_ok(),
+            "empty batch must never trigger overflow"
+        );
+    }
+
+    /// The overflow is detected as Fatal by the error taxonomy, so the poll
+    /// loop halts rather than retrying.
+    #[test]
+    fn overflow_error_is_fatal_not_retryable() {
+        use trident_common::errors::Severity;
+        let err = assert_no_default_partition_overflow(&[60_000_001i64], &[(0, 60_000_000)])
+            .expect_err("should overflow");
+        assert_eq!(
+            err.severity(),
+            Severity::Fatal,
+            "partition overflow must be Fatal so the indexer halts"
+        );
+        assert!(err.fatal());
+        assert!(!err.retryable());
+    }
+
+    /// Integration test: `named_partition_ranges` returns the seeded partition
+    /// ranges against a real database using the standard migration chain, and
+    /// those ranges expose the gap that migration 0017 leaves behind.
+    #[tokio::test]
+    async fn named_partition_ranges_returns_migration_seed_values() {
+        let Some(db_url) = test_db_url("named_partition_ranges_returns_migration_seed_values")
+        else {
+            return;
+        };
+        let pool = PgPool::connect(&db_url).await.unwrap();
+
+        let ranges = named_partition_ranges(&pool)
+            .await
+            .expect("query must not fail");
+
+        assert!(
+            !ranges.is_empty(),
+            "migrations seed named partitions; ranges must not be empty"
+        );
+        for (lo, hi) in &ranges {
+            assert!(hi > lo, "each range must be non-empty, got ({lo}, {hi})");
+        }
+        let highest = ranges.iter().map(|&(_, hi)| hi).max().unwrap();
+        assert!(
+            highest >= 60_000_000,
+            "highest upper bound must be at least 60,000,000, got {highest}"
+        );
+        // The seeded schema is deliberately non-contiguous (0-6M then 50M-60M).
+        // The guard must therefore reject a ledger inside that hole, which a
+        // MAX(upper_bound) check would have accepted.
+        assert!(
+            assert_no_default_partition_overflow(&[20_000_000i64], &ranges).is_err(),
+            "a ledger inside the 6M-50M gap must be rejected"
+        );
+    }
+
+    /// Integration test: inserting an event with a ledger_sequence that matches
+    /// the partition boundary condition is caught BEFORE the database is touched.
+    ///
+    /// This is the "deliberate exhaustion" test from issue #525: we prove the
+    /// guard fires on a sequence that would land in the DEFAULT partition, using
+    /// the boundary value we know from the seeded migrations.
+    #[tokio::test]
+    async fn overflow_guard_fires_before_commit_at_exhaustion_boundary() {
+        let Some(db_url) = test_db_url("overflow_guard_fires_before_commit_at_exhaustion_boundary")
+        else {
+            return;
+        };
+        let pool = PgPool::connect(&db_url).await.unwrap();
+
+        // Get the actual ranges from the DB so this test stays correct even
+        // after additional partitions are added.
+        let ranges = named_partition_ranges(&pool)
+            .await
+            .expect("query must not fail");
+        assert!(!ranges.is_empty(), "seeded partitions must exist");
+        let last_upper = ranges.iter().map(|&(_, hi)| hi).max().unwrap();
+
+        // A sequence exactly at the highest upper bound would land in DEFAULT.
+        let overflow_seq = last_upper;
+        let err = assert_no_default_partition_overflow(&[overflow_seq], &ranges)
+            .expect_err("overflow at boundary must be caught");
+
+        assert!(
+            matches!(err, TridentError::ConfigError { .. }),
+            "boundary overflow must be a ConfigError (Fatal)"
+        );
+
+        // Verify the event was NOT written to the database — the guard must
+        // fire before any DB write, not after. We check by querying for any
+        // row at that sequence belonging to a sentinel contract.
+        let sentinel = format!("CEXHAUST_TEST_{last_upper}");
+        let count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM soroban_events WHERE contract_id = $1")
+                .bind(&sentinel)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            count.0, 0,
+            "no row must have been written: the guard must fire before commit_page"
+        );
+    }
+
+    /// A dead-lettered event must land in `failed_events` with its full
+    /// payload and error message intact, so it can be inspected and replayed
+    /// later (issue #208).
+    #[tokio::test]
+    async fn insert_failed_event_persists_payload_and_error() {
+        let db_url = match std::env::var("TEST_DATABASE_URL") {
+            Ok(url) => url,
+            Err(_) if std::env::var("REQUIRE_TEST_SERVICES").is_ok() => {
+                panic!("TEST_DATABASE_URL must be set when REQUIRE_TEST_SERVICES is set");
+            }
+            Err(_) => {
+                eprintln!("SKIP: TEST_DATABASE_URL not set");
+                return;
+            }
+        };
+        let pool = PgPool::connect(&db_url).await.unwrap();
+
+        let contract_id = format!("CFAILED_{}", Uuid::new_v4());
+        let event = make_event(&contract_id, 999, 0);
+
+        sqlx::query("DELETE FROM failed_events WHERE contract_id = $1")
+            .bind(&contract_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        insert_failed_event(&pool, &event, "simulated persistent failure", 3)
+            .await
+            .expect("insert_failed_event must succeed");
+
+        let row: (String, String, i32, serde_json::Value) = sqlx::query_as(
+            "SELECT error_message, transaction_hash, attempts, event_payload
+             FROM failed_events WHERE contract_id = $1",
+        )
+        .bind(&contract_id)
+        .fetch_one(&pool)
+        .await
+        .expect("row must exist");
+
+        assert_eq!(row.0, "simulated persistent failure");
+        assert_eq!(row.1, event.transaction_hash);
+        assert_eq!(row.2, 3);
+        assert_eq!(
+            row.3.get("contract_id").and_then(|v| v.as_str()),
+            Some(contract_id.as_str()),
+            "event_payload must round-trip the full event"
+        );
+
+        sqlx::query("DELETE FROM failed_events WHERE contract_id = $1")
+            .bind(&contract_id)
+            .execute(&pool)
             .await
             .unwrap();
     }

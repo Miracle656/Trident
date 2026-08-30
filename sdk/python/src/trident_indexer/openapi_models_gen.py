@@ -197,6 +197,43 @@ class ContractEventSchemaResponse:
 
 
 @dataclass
+class ContractResponse:
+    contract_id: str
+    """Stellar contract id (C... strkey)."""
+
+    created_at: str
+    id: UUID
+    index_from: int
+    """Ledger sequence indexing began from."""
+
+    label: str | None = None
+    network: str | None = None
+
+    @staticmethod
+    def from_dict(obj: Any) -> 'ContractResponse':
+        assert isinstance(obj, dict)
+        contract_id = from_str(obj.get("contract_id"))
+        created_at = from_str(obj.get("created_at"))
+        id = UUID(obj.get("id"))
+        index_from = from_int(obj.get("index_from"))
+        label = from_union([from_str, from_none], obj.get("label"))
+        network = from_union([from_str, from_none], obj.get("network"))
+        return ContractResponse(contract_id, created_at, id, index_from, label, network)
+
+    def to_dict(self) -> dict:
+        result: dict = {}
+        result["contract_id"] = from_str(self.contract_id)
+        result["created_at"] = from_str(self.created_at)
+        result["id"] = str(self.id)
+        result["index_from"] = from_int(self.index_from)
+        if self.label is not None:
+            result["label"] = from_union([from_str, from_none], self.label)
+        if self.network is not None:
+            result["network"] = from_union([from_str, from_none], self.network)
+        return result
+
+
+@dataclass
 class ContractSpecFunction:
     name: str
     """Exported function name"""
@@ -322,11 +359,17 @@ class ContractStatsResponse:
     generated_at: str
     """Timestamp when response was generated"""
 
+    has_more: bool
+    """Whether more pages are available"""
+
     network: Network
     """Network queried"""
 
     to_ledger: int
     """Upper bound of queried ledger range"""
+
+    next_cursor: str | None = None
+    """Opaque cursor to pass as the cursor parameter for the next page"""
 
     @staticmethod
     def from_dict(obj: Any) -> 'ContractStatsResponse':
@@ -334,17 +377,22 @@ class ContractStatsResponse:
         contracts = from_list(ContractStats.from_dict, obj.get("contracts"))
         from_ledger = from_int(obj.get("from_ledger"))
         generated_at = from_str(obj.get("generated_at"))
+        has_more = from_bool(obj.get("has_more"))
         network = Network(obj.get("network"))
         to_ledger = from_int(obj.get("to_ledger"))
-        return ContractStatsResponse(contracts, from_ledger, generated_at, network, to_ledger)
+        next_cursor = from_union([from_str, from_none], obj.get("next_cursor"))
+        return ContractStatsResponse(contracts, from_ledger, generated_at, has_more, network, to_ledger, next_cursor)
 
     def to_dict(self) -> dict:
         result: dict = {}
         result["contracts"] = from_list(lambda x: to_class(ContractStats, x), self.contracts)
         result["from_ledger"] = from_int(self.from_ledger)
         result["generated_at"] = from_str(self.generated_at)
+        result["has_more"] = from_bool(self.has_more)
         result["network"] = to_enum(Network, self.network)
         result["to_ledger"] = from_int(self.to_ledger)
+        if self.next_cursor is not None:
+            result["next_cursor"] = from_union([from_str, from_none], self.next_cursor)
         return result
 
 
@@ -386,6 +434,49 @@ class ContractStorageValue:
 
 
 @dataclass
+class ContractStorageHistoryResponse:
+    contract_id: str
+    """The contract whose storage history was queried"""
+
+    has_more: bool
+    """Whether more pages are available"""
+
+    network: str
+    """Network the contract is indexed on"""
+
+    storage_key: str
+    """The storage key whose history was queried"""
+
+    values: list[ContractStorageValue]
+    """Storage history entries, oldest first"""
+
+    next_cursor: str | None = None
+    """Opaque cursor to pass as the cursor parameter for the next page"""
+
+    @staticmethod
+    def from_dict(obj: Any) -> 'ContractStorageHistoryResponse':
+        assert isinstance(obj, dict)
+        contract_id = from_str(obj.get("contract_id"))
+        has_more = from_bool(obj.get("has_more"))
+        network = from_str(obj.get("network"))
+        storage_key = from_str(obj.get("storage_key"))
+        values = from_list(ContractStorageValue.from_dict, obj.get("values"))
+        next_cursor = from_union([from_str, from_none], obj.get("next_cursor"))
+        return ContractStorageHistoryResponse(contract_id, has_more, network, storage_key, values, next_cursor)
+
+    def to_dict(self) -> dict:
+        result: dict = {}
+        result["contract_id"] = from_str(self.contract_id)
+        result["has_more"] = from_bool(self.has_more)
+        result["network"] = from_str(self.network)
+        result["storage_key"] = from_str(self.storage_key)
+        result["values"] = from_list(lambda x: to_class(ContractStorageValue, x), self.values)
+        if self.next_cursor is not None:
+            result["next_cursor"] = from_union([from_str, from_none], self.next_cursor)
+        return result
+
+
+@dataclass
 class ContractStorageResponse:
     contract_id: str
     """Soroban contract address"""
@@ -415,7 +506,7 @@ class ContractStorageResponse:
 @dataclass
 class Error:
     code: str
-    """Error code (e.g., INVALID_ARGUMENT, INTERNAL, UNAVAILABLE)"""
+    """Error code (e.g., INVALID_ARGUMENT, INTERNAL, UNAVAILABLE, CONFLICT)"""
 
     message: str
     """Human-readable error message"""
@@ -626,6 +717,56 @@ class IndexerStatsResponse:
         return result
 
 
+@dataclass
+class ListAPIKeysResponse:
+    api_keys: list[APIKeyResponse]
+    has_more: bool
+    """Whether another page is available."""
+
+    next_cursor: str
+    """Opaque cursor for the next page (null if has_more is false)."""
+
+    @staticmethod
+    def from_dict(obj: Any) -> 'ListAPIKeysResponse':
+        assert isinstance(obj, dict)
+        api_keys = from_list(APIKeyResponse.from_dict, obj.get("api_keys"))
+        has_more = from_bool(obj.get("has_more"))
+        next_cursor = from_str(obj.get("next_cursor"))
+        return ListAPIKeysResponse(api_keys, has_more, next_cursor)
+
+    def to_dict(self) -> dict:
+        result: dict = {}
+        result["api_keys"] = from_list(lambda x: to_class(APIKeyResponse, x), self.api_keys)
+        result["has_more"] = from_bool(self.has_more)
+        result["next_cursor"] = from_str(self.next_cursor)
+        return result
+
+
+@dataclass
+class ListContractsResponse:
+    contracts: list[ContractResponse]
+    has_more: bool
+    """Whether another page is available."""
+
+    next_cursor: str
+    """Opaque cursor for the next page (null if has_more is false)."""
+
+    @staticmethod
+    def from_dict(obj: Any) -> 'ListContractsResponse':
+        assert isinstance(obj, dict)
+        contracts = from_list(ContractResponse.from_dict, obj.get("contracts"))
+        has_more = from_bool(obj.get("has_more"))
+        next_cursor = from_str(obj.get("next_cursor"))
+        return ListContractsResponse(contracts, has_more, next_cursor)
+
+    def to_dict(self) -> dict:
+        result: dict = {}
+        result["contracts"] = from_list(lambda x: to_class(ContractResponse, x), self.contracts)
+        result["has_more"] = from_bool(self.has_more)
+        result["next_cursor"] = from_str(self.next_cursor)
+        return result
+
+
 class LivenessResponseStatus(Enum):
     """Always "ok" while the process is up — no dependency checks."""
 
@@ -805,15 +946,19 @@ class OpenAPIModels:
     contract_event_field_schema: ContractEventFieldSchema | None = None
     contract_event_schema: ContractEventSchema | None = None
     contract_event_schema_response: ContractEventSchemaResponse | None = None
+    contract_response: ContractResponse | None = None
     contract_spec_function: ContractSpecFunction | None = None
     contract_spec_response: ContractSpecResponse | None = None
     contract_stats: ContractStats | None = None
     contract_stats_response: ContractStatsResponse | None = None
+    contract_storage_history_response: ContractStorageHistoryResponse | None = None
     contract_storage_response: ContractStorageResponse | None = None
     contract_storage_value: ContractStorageValue | None = None
     error_response: ErrorResponse | None = None
     event_list_response: EventListResponse | None = None
     indexer_stats_response: IndexerStatsResponse | None = None
+    list_api_keys_response: ListAPIKeysResponse | None = None
+    list_contracts_response: ListContractsResponse | None = None
     liveness_response: LivenessResponse | None = None
     ready_checks: ReadyChecks | None = None
     ready_response: ReadyResponse | None = None
@@ -828,22 +973,26 @@ class OpenAPIModels:
         contract_event_field_schema = from_union([ContractEventFieldSchema.from_dict, from_none], obj.get("ContractEventFieldSchema"))
         contract_event_schema = from_union([ContractEventSchema.from_dict, from_none], obj.get("ContractEventSchema"))
         contract_event_schema_response = from_union([ContractEventSchemaResponse.from_dict, from_none], obj.get("ContractEventSchemaResponse"))
+        contract_response = from_union([ContractResponse.from_dict, from_none], obj.get("ContractResponse"))
         contract_spec_function = from_union([ContractSpecFunction.from_dict, from_none], obj.get("ContractSpecFunction"))
         contract_spec_response = from_union([ContractSpecResponse.from_dict, from_none], obj.get("ContractSpecResponse"))
         contract_stats = from_union([ContractStats.from_dict, from_none], obj.get("ContractStats"))
         contract_stats_response = from_union([ContractStatsResponse.from_dict, from_none], obj.get("ContractStatsResponse"))
+        contract_storage_history_response = from_union([ContractStorageHistoryResponse.from_dict, from_none], obj.get("ContractStorageHistoryResponse"))
         contract_storage_response = from_union([ContractStorageResponse.from_dict, from_none], obj.get("ContractStorageResponse"))
         contract_storage_value = from_union([ContractStorageValue.from_dict, from_none], obj.get("ContractStorageValue"))
         error_response = from_union([ErrorResponse.from_dict, from_none], obj.get("ErrorResponse"))
         event_list_response = from_union([EventListResponse.from_dict, from_none], obj.get("EventListResponse"))
         indexer_stats_response = from_union([IndexerStatsResponse.from_dict, from_none], obj.get("IndexerStatsResponse"))
+        list_api_keys_response = from_union([ListAPIKeysResponse.from_dict, from_none], obj.get("ListAPIKeysResponse"))
+        list_contracts_response = from_union([ListContractsResponse.from_dict, from_none], obj.get("ListContractsResponse"))
         liveness_response = from_union([LivenessResponse.from_dict, from_none], obj.get("LivenessResponse"))
         ready_checks = from_union([ReadyChecks.from_dict, from_none], obj.get("ReadyChecks"))
         ready_response = from_union([ReadyResponse.from_dict, from_none], obj.get("ReadyResponse"))
         soroban_event = from_union([SorobanEvent.from_dict, from_none], obj.get("SorobanEvent"))
         token_metadata_response = from_union([TokenMetadataResponse.from_dict, from_none], obj.get("TokenMetadataResponse"))
         version_response = from_union([VersionResponse.from_dict, from_none], obj.get("VersionResponse"))
-        return OpenAPIModels(api_key_response, contract_event_field_schema, contract_event_schema, contract_event_schema_response, contract_spec_function, contract_spec_response, contract_stats, contract_stats_response, contract_storage_response, contract_storage_value, error_response, event_list_response, indexer_stats_response, liveness_response, ready_checks, ready_response, soroban_event, token_metadata_response, version_response)
+        return OpenAPIModels(api_key_response, contract_event_field_schema, contract_event_schema, contract_event_schema_response, contract_response, contract_spec_function, contract_spec_response, contract_stats, contract_stats_response, contract_storage_history_response, contract_storage_response, contract_storage_value, error_response, event_list_response, indexer_stats_response, list_api_keys_response, list_contracts_response, liveness_response, ready_checks, ready_response, soroban_event, token_metadata_response, version_response)
 
     def to_dict(self) -> dict:
         result: dict = {}
@@ -855,6 +1004,8 @@ class OpenAPIModels:
             result["ContractEventSchema"] = from_union([lambda x: to_class(ContractEventSchema, x), from_none], self.contract_event_schema)
         if self.contract_event_schema_response is not None:
             result["ContractEventSchemaResponse"] = from_union([lambda x: to_class(ContractEventSchemaResponse, x), from_none], self.contract_event_schema_response)
+        if self.contract_response is not None:
+            result["ContractResponse"] = from_union([lambda x: to_class(ContractResponse, x), from_none], self.contract_response)
         if self.contract_spec_function is not None:
             result["ContractSpecFunction"] = from_union([lambda x: to_class(ContractSpecFunction, x), from_none], self.contract_spec_function)
         if self.contract_spec_response is not None:
@@ -863,6 +1014,8 @@ class OpenAPIModels:
             result["ContractStats"] = from_union([lambda x: to_class(ContractStats, x), from_none], self.contract_stats)
         if self.contract_stats_response is not None:
             result["ContractStatsResponse"] = from_union([lambda x: to_class(ContractStatsResponse, x), from_none], self.contract_stats_response)
+        if self.contract_storage_history_response is not None:
+            result["ContractStorageHistoryResponse"] = from_union([lambda x: to_class(ContractStorageHistoryResponse, x), from_none], self.contract_storage_history_response)
         if self.contract_storage_response is not None:
             result["ContractStorageResponse"] = from_union([lambda x: to_class(ContractStorageResponse, x), from_none], self.contract_storage_response)
         if self.contract_storage_value is not None:
@@ -873,6 +1026,10 @@ class OpenAPIModels:
             result["EventListResponse"] = from_union([lambda x: to_class(EventListResponse, x), from_none], self.event_list_response)
         if self.indexer_stats_response is not None:
             result["IndexerStatsResponse"] = from_union([lambda x: to_class(IndexerStatsResponse, x), from_none], self.indexer_stats_response)
+        if self.list_api_keys_response is not None:
+            result["ListAPIKeysResponse"] = from_union([lambda x: to_class(ListAPIKeysResponse, x), from_none], self.list_api_keys_response)
+        if self.list_contracts_response is not None:
+            result["ListContractsResponse"] = from_union([lambda x: to_class(ListContractsResponse, x), from_none], self.list_contracts_response)
         if self.liveness_response is not None:
             result["LivenessResponse"] = from_union([lambda x: to_class(LivenessResponse, x), from_none], self.liveness_response)
         if self.ready_checks is not None:

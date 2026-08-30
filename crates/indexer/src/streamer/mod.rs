@@ -509,6 +509,33 @@ impl Streamer {
         // refreshes it, but the deficit we were working against is this one.
         let cursor_at_start = *cursor;
         let lag_at_start = self.last_chain_tip.saturating_sub(cursor_at_start) as i64;
+
+        // Query the named partition ranges once per poll cycle so every insert
+        // in this cycle can check whether it would fall outside them and land
+        // in the DEFAULT catch-all partition (issue #525).
+        let partition_ranges = match db::named_partition_ranges(&self.db).await {
+            Ok(ranges) if !ranges.is_empty() => {
+                let highest = ranges.iter().map(|&(_, hi)| hi).max().unwrap_or(0);
+                metrics::set_partition_lookahead(highest.saturating_sub(*cursor as i64));
+                ranges
+            }
+            Ok(_) => {
+                // No named partitions at all — every insert would land in
+                // DEFAULT. This is a real misconfiguration, not a blip.
+                return Err(TridentError::config(anyhow::anyhow!(
+                    "partition exhaustion: soroban_events has no named range partitions.                      All inserts would land in soroban_events_default.                      Run `SELECT create_soroban_partition(0, 2000000);` to create the                      first partition (issue #525)."
+                )));
+            }
+            Err(e) => {
+                // A failed catalogue query is usually a transient connection
+                // problem. Returning a config error here would classify it as
+                // Fatal and halt ingestion permanently, so surface it as the
+                // storage error it is and let the caller's retry path handle it.
+                return Err(TridentError::storage(anyhow::Error::new(e).context(
+                    "could not query soroban_events partition ranges (issue #525)",
+                )));
+            }
+        };
         let retry_strategy = ExponentialBackoff::from_millis(200)
             .max_delay(Duration::from_secs(2))
             .take(5);
@@ -754,6 +781,23 @@ impl Streamer {
             // (issue #388).
             crate::parser::assign_unique_event_indexes(&mut page_events);
 
+            // Partition boundary guard (issue #525): verify no event in this
+            // page would overflow into soroban_events_default before we touch
+            // the database. Uses the boundary queried at the top of this cycle
+            // so there is no extra round-trip per page.
+            //
+            // This returns TridentError::ConfigError (Severity::Fatal), which
+            // causes the poll loop to halt and log an ERROR rather than
+            // silently retrying — the intended loud-failure behaviour for
+            // partition exhaustion.
+            if !page_events.is_empty() {
+                let ledger_sequences: Vec<i64> = page_events
+                    .iter()
+                    .map(|e| e.ledger_sequence as i64)
+                    .collect();
+                db::assert_no_default_partition_overflow(&ledger_sequences, &partition_ranges)?;
+            }
+
             // One transaction for the whole page: events, cursor, and ledger
             // metadata land together or not at all, so a crash can never leave
             // the cursor ahead of the events it claims to cover (issue #199).
@@ -886,23 +930,21 @@ impl Streamer {
                 })
                 .collect();
 
-            db::commit_page(
+            commit_page_with_fallback(
                 &self.db,
-                db::PageCommit {
-                    events: &page_events,
-                    token_events: &token_projections,
-                    invocation_metrics: &invocation_metrics,
-                    storage_snapshots: &storage_snapshots,
-                    network: &self.config.network,
-                    cursor: next_cursor,
-                    ledger: next_cursor.map(|_| db::LedgerMeta {
-                        sequence: ledger_sequence,
-                        hash: &ledger_hash,
-                        timestamp: &ledger_timestamp,
-                        event_count: events_in_page,
-                    }),
-                    batch_size: self.config.db_batch_size,
-                },
+                &page_events,
+                &page_tokens,
+                &invocation_metrics,
+                &storage_snapshots,
+                &self.config.network,
+                next_cursor,
+                next_cursor.map(|_| db::LedgerMeta {
+                    sequence: ledger_sequence,
+                    hash: &ledger_hash,
+                    timestamp: &ledger_timestamp,
+                    event_count: events_in_page,
+                }),
+                self.config.db_batch_size,
             )
             .instrument(tracing::info_span!(
                 "db_commit_page",
@@ -1079,6 +1121,182 @@ fn parse_retained_floor(message: &str) -> Option<u64> {
     // A well-formed range only; anything inverted means the message shape
     // changed and the value should not be trusted.
     (low <= high).then_some(low)
+}
+
+/// Commit a page atomically when possible, and fall back to per-event
+/// isolation when it is not — so one event that cannot be persisted can never
+/// wedge the cursor and block every other, otherwise-valid event in the page
+/// behind it (issue #208).
+///
+/// Three stages:
+///
+/// 1. Try the whole page as one transaction (the fast path — `db::commit_page`
+///    already batches this efficiently), with a few retries on failure. Most
+///    failures are transient (a connection blip, a lock wait, a statement
+///    timeout) and clear well within this budget.
+/// 2. If the whole page still cannot be committed atomically, commit each
+///    event individually instead. This is the mechanism that actually
+///    distinguishes "transient" from "permanent": an event that keeps
+///    failing even in isolation, with nothing else in its transaction that
+///    could be the real cause, is genuinely unpersistable right now. One that
+///    succeeds alone was never the problem — some other row in the original
+///    batch was, and this isolates it without guessing at error strings.
+/// 3. Events that still fail after per-event retries are written to
+///    `failed_events` (a dead-letter queue analogous to `parse_errors`, but
+///    for well-formed events whose storage write failed rather than events
+///    that failed to decode) and skipped, so the page's cursor/ledger
+///    metadata commit — and therefore progress — is never blocked on them.
+///
+/// `invocation_metrics` and `storage_snapshots` are supplementary projections
+/// keyed by (contract, transaction) rather than by individual event; they are
+/// not meaningful to split per-event, so in the fallback path they ride with
+/// the final cursor/ledger commit instead.
+#[allow(clippy::too_many_arguments)]
+async fn commit_page_with_fallback(
+    db: &PgPool,
+    page_events: &[trident_common::SorobanEvent],
+    page_tokens: &[(usize, crate::parser::token_events::TokenEvent)],
+    invocation_metrics: &[db::InvocationMetricRow<'_>],
+    storage_snapshots: &[db::StorageSnapshotRow<'_>],
+    network: &str,
+    cursor: Option<u64>,
+    ledger: Option<db::LedgerMeta<'_>>,
+    batch_size: usize,
+) -> Result<(), TridentError> {
+    let token_projections: Vec<db::TokenProjection<'_>> = page_tokens
+        .iter()
+        .map(|(index, token)| db::TokenProjection {
+            event: &page_events[*index],
+            token,
+        })
+        .collect();
+
+    let whole_page_strategy = ExponentialBackoff::from_millis(200)
+        .max_delay(Duration::from_secs(2))
+        .take(3);
+    let whole_page_result = Retry::start(whole_page_strategy, || async {
+        db::commit_page(
+            db,
+            db::PageCommit {
+                events: page_events,
+                token_events: &token_projections,
+                invocation_metrics,
+                storage_snapshots,
+                network,
+                cursor,
+                ledger: ledger.as_ref().map(|l| db::LedgerMeta {
+                    sequence: l.sequence,
+                    hash: l.hash,
+                    timestamp: l.timestamp,
+                    event_count: l.event_count,
+                }),
+                batch_size,
+            },
+        )
+        .await
+    })
+    .await;
+
+    let whole_page_err = match whole_page_result {
+        Ok(()) => return Ok(()),
+        Err(e) => e,
+    };
+    tracing::warn!(
+        error = %whole_page_err,
+        events = page_events.len(),
+        "Whole-page commit failed after retries; falling back to per-event isolation"
+    );
+
+    let token_by_index: HashMap<usize, &crate::parser::token_events::TokenEvent> =
+        page_tokens.iter().map(|(i, t)| (*i, t)).collect();
+
+    for (index, event) in page_events.iter().enumerate() {
+        let single_event = std::slice::from_ref(event);
+        let single_token: Vec<db::TokenProjection<'_>> = token_by_index
+            .get(&index)
+            .map(|token| vec![db::TokenProjection { event, token }])
+            .unwrap_or_default();
+
+        let per_event_strategy = ExponentialBackoff::from_millis(100)
+            .max_delay(Duration::from_secs(1))
+            .take(3);
+        let mut attempts = 0u32;
+        let result = Retry::start(per_event_strategy, || {
+            attempts += 1;
+            async {
+                db::commit_page(
+                    db,
+                    db::PageCommit {
+                        events: single_event,
+                        token_events: &single_token,
+                        invocation_metrics: &[],
+                        storage_snapshots: &[],
+                        network,
+                        cursor: None,
+                        ledger: None,
+                        batch_size,
+                    },
+                )
+                .await
+            }
+        })
+        .await;
+
+        if let Err(e) = result {
+            tracing::error!(
+                contract_id = %event.contract_id,
+                tx_hash = %event.transaction_hash,
+                ledger = event.ledger_sequence,
+                error = %e,
+                attempts,
+                "Event failed to persist after per-event retries; dead-lettering"
+            );
+            match db::insert_failed_event(db, event, &e.to_string(), attempts).await {
+                Ok(()) => metrics::record_dead_lettered(),
+                Err(dl_err) => {
+                    // The dead-letter write goes to the same database the
+                    // event's own INSERT just failed against. Failing here is
+                    // therefore evidence that the *database* is unavailable,
+                    // not that this event is unpersistable — the inference the
+                    // isolation retry relies on does not hold.
+                    //
+                    // Swallowing this and letting the cursor advance below
+                    // would discard the event permanently: absent from
+                    // soroban_events, absent from failed_events, and the
+                    // cursor moved past it. Propagating instead leaves the
+                    // cursor where it is so the next poll retries the page —
+                    // duplicates are already absorbed downstream by the
+                    // deterministic UUIDv5 keys and ON CONFLICT DO NOTHING,
+                    // so a retry is safe in a way that data loss is not.
+                    tracing::error!(
+                        error = %dl_err,
+                        contract_id = %event.contract_id,
+                        tx_hash = %event.transaction_hash,
+                        "Failed to write failed_events row; refusing to advance the cursor past an unpersisted event"
+                    );
+                    return Err(dl_err);
+                }
+            }
+        }
+    }
+
+    // Every event has now either been persisted or dead-lettered, so the
+    // page's cursor/ledger advance (and the supplementary invocation-metrics
+    // and storage-snapshot projections) can commit on their own.
+    db::commit_page(
+        db,
+        db::PageCommit {
+            events: &[],
+            token_events: &[],
+            invocation_metrics,
+            storage_snapshots,
+            network,
+            cursor,
+            ledger,
+            batch_size,
+        },
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -1333,6 +1551,136 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count.0, 3, "expected 3 events in soroban_events");
+    }
+
+    /// A single event with an unparseable `ledgerClosedAt` poisons the whole
+    /// batched INSERT (EventColumns::build fails for the chunk containing
+    /// it), which used to abort the entire page and leave every otherwise-
+    /// valid event unindexed with the cursor stuck. `commit_page_with_fallback`
+    /// must isolate the poison event into `failed_events`, persist the rest,
+    /// and still advance the cursor (issue #208).
+    #[tokio::test]
+    async fn poison_event_is_dead_lettered_and_page_still_advances_cursor() {
+        let (db_url, redis_url) = require_services!();
+        let server = MockServer::start().await;
+
+        let contract_id = format!("CPOISON_{}", uuid::Uuid::new_v4());
+        // Must fall inside a named partition. Migration 0017 creates 0-6M and
+        // 50M-60M with a gap between, and the #525 exhaustion guard rejects
+        // any ledger that gap would send to soroban_events_default — so 9M
+        // failed here for a reason unrelated to what this test asserts.
+        let ledger = 5_000_000u64;
+        let page = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "events": [
+                    {
+                        "type": "contract",
+                        "ledger": ledger.to_string(),
+                        "ledgerClosedAt": "2024-01-01T00:00:00Z",
+                        "contractId": contract_id,
+                        "id": format!("{:016}-0", ledger),
+                        "pagingToken": format!("{}-0", ledger),
+                        "txHash": "good1good1good1",
+                        "topic": [sym_xdr("transfer")],
+                        "value": void_xdr(),
+                        "inSuccessfulContractCall": true
+                    },
+                    {
+                        "type": "contract",
+                        "ledger": ledger.to_string(),
+                        // Not a valid RFC3339 timestamp: EventColumns::build's
+                        // `.parse::<DateTime<Utc>>()` fails on this event and
+                        // only this event, poisoning any batch it rides in.
+                        "ledgerClosedAt": "not-a-real-timestamp",
+                        "contractId": contract_id,
+                        "id": format!("{:016}-1", ledger),
+                        "pagingToken": format!("{}-1", ledger),
+                        "txHash": "poisonpoisonpoi",
+                        "topic": [sym_xdr("transfer")],
+                        "value": void_xdr(),
+                        "inSuccessfulContractCall": true
+                    },
+                    {
+                        "type": "contract",
+                        "ledger": ledger.to_string(),
+                        // Last event's ledgerClosedAt also feeds
+                        // ledger_metadata — must stay valid so only the
+                        // per-event insert (not the final cursor/ledger
+                        // commit) is exercised by the poison row above.
+                        "ledgerClosedAt": "2024-01-01T00:00:00Z",
+                        "contractId": contract_id,
+                        "id": format!("{:016}-2", ledger),
+                        "pagingToken": format!("{}-2", ledger),
+                        "txHash": "good2good2good2",
+                        "topic": [sym_xdr("transfer")],
+                        "value": void_xdr(),
+                        "inSuccessfulContractCall": true
+                    }
+                ],
+                "latestLedger": ledger
+            }
+        });
+
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(rpc_ok(page))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(rpc_ok(events_page(ledger, 0)))
+            .mount(&server)
+            .await;
+
+        let mut s = make_streamer(&db_url, &redis_url, server.uri()).await;
+        reset_db(&s.db).await;
+
+        let mut cursor = 0u64;
+        s.poll_once(&mut cursor)
+            .await
+            .expect("poll_once must not fail even though one event is unpersistable");
+
+        assert_eq!(
+            cursor, ledger,
+            "cursor must advance past the page despite the poison event"
+        );
+        let stored_cursor = db::get_cursor(&s.db).await.unwrap();
+        assert_eq!(stored_cursor, ledger);
+
+        let good_count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM soroban_events WHERE contract_id = $1")
+                .bind(&contract_id)
+                .fetch_one(&s.db)
+                .await
+                .unwrap();
+        assert_eq!(good_count.0, 2, "both non-poison events must be persisted");
+
+        let failed: (i64, String) = sqlx::query_as(
+            "SELECT COUNT(*), MAX(transaction_hash) FROM failed_events WHERE contract_id = $1",
+        )
+        .bind(&contract_id)
+        .fetch_one(&s.db)
+        .await
+        .unwrap();
+        assert_eq!(
+            failed.0, 1,
+            "exactly the poison event must be dead-lettered"
+        );
+        assert_eq!(failed.1, "poisonpoisonpoi");
+
+        sqlx::query("DELETE FROM soroban_events WHERE contract_id = $1")
+            .bind(&contract_id)
+            .execute(&s.db)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM failed_events WHERE contract_id = $1")
+            .bind(&contract_id)
+            .execute(&s.db)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

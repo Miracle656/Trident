@@ -1,6 +1,6 @@
 -- Trident PostgreSQL Schema
 -- Convenience full-schema snapshot for local/dev bootstrap and documentation.
--- The migration chain in ./migrations/ (0001-0025) is the source of truth and is
+-- The migration chain in ./migrations/ (0001-0029) is the source of truth and is
 -- what CI and production apply; this file must mirror the end state of that chain.
 -- Keep in sync whenever a migration is added.
 
@@ -152,8 +152,28 @@ CREATE TABLE IF NOT EXISTS audit_log (
     ts           TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX IF NOT EXISTS idx_audit_log_key_ts ON audit_log (api_key_id, ts DESC);
-CREATE INDEX IF NOT EXISTS idx_audit_log_ts     ON audit_log (ts DESC);
+-- Covers the admin analytics queries (migration 0029). The INCLUDE columns
+-- are read but never seeked on, so they live only in the leaves and make
+-- those queries index-only rather than paying a heap visit per matching row.
+-- Supersedes the original idx_audit_log_key_ts (api_key_id, ts DESC), which
+-- was a strict prefix of this index.
+CREATE INDEX IF NOT EXISTS idx_audit_log_key_ts_covering
+    ON audit_log (api_key_id, ts DESC)
+    INCLUDE (status_code, endpoint, duration_ms);
+
+-- Covers the usage rollup job (migration 0029). Partial on the job's own
+-- WHERE clause: rows whose key was deleted (api_key_id is ON DELETE SET
+-- NULL) can never contribute to a per-key rollup.
+CREATE INDEX IF NOT EXISTS idx_audit_log_rollup
+    ON audit_log (ts)
+    INCLUDE (api_key_id, status_code, duration_ms)
+    WHERE api_key_id IS NOT NULL;
+
+-- Time-range scans over all rows, including those with a NULL api_key_id
+-- that idx_audit_log_rollup excludes. Also what the retention cleanup falls
+-- back to once its predicate becomes selective enough to prefer an index —
+-- see docs/db/explain-audit-log-247.txt.
+CREATE INDEX IF NOT EXISTS idx_audit_log_ts ON audit_log (ts DESC);
 
 -- ---------------------------------------------------------------------------
 -- parse_errors
@@ -219,6 +239,8 @@ CREATE TABLE IF NOT EXISTS webhook_subscriptions (
     topic0       TEXT,
     target_url   TEXT        NOT NULL,
     secret       TEXT        NOT NULL,
+    -- Previous secret, retained during a rotation overlap window (issue #452).
+    secondary_secret TEXT,
     created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     paused_at    TIMESTAMPTZ,
@@ -253,6 +275,11 @@ CREATE TRIGGER trg_webhook_subscriptions_updated_at
 
 CREATE INDEX IF NOT EXISTS idx_webhook_subscriptions_contract_id ON webhook_subscriptions (contract_id);
 CREATE INDEX IF NOT EXISTS idx_webhook_subscriptions_paused_at ON webhook_subscriptions (paused_at);
+-- Partial index over rows in a rotation overlap window, used by the cleanup
+-- job that expires secondary secrets (issue #452).
+CREATE INDEX IF NOT EXISTS idx_webhook_subscriptions_secondary_secret
+    ON webhook_subscriptions (updated_at)
+    WHERE secondary_secret IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_subscription_id ON webhook_deliveries (subscription_id);
 CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_dead_lettered ON webhook_deliveries (subscription_id, delivered_at DESC) WHERE (status = 'dead_lettered');
 
@@ -509,3 +536,25 @@ ALTER TABLE contract_storage_snapshots ADD CONSTRAINT contract_storage_snapshots
 
 CREATE UNIQUE INDEX IF NOT EXISTS contract_storage_snapshots_contract_id_network_storage_key__key ON contract_storage_snapshots USING btree (contract_id, network, storage_key, ledger_sequence);
 CREATE INDEX IF NOT EXISTS idx_contract_storage_snapshots_latest ON contract_storage_snapshots USING btree (contract_id, network, storage_key, ledger_sequence DESC);
+
+-- ---------------------------------------------------------------------------
+-- failed_events  (migration 0027)
+-- Dead-letter queue for well-formed events that repeatedly failed to persist.
+-- Distinct from parse_errors above: this is for events that decoded fine but
+-- whose INSERT kept failing after bounded retries.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS failed_events (
+    id               UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    ledger_sequence  BIGINT      NOT NULL,
+    contract_id      TEXT        NOT NULL,
+    transaction_hash TEXT        NOT NULL,
+    event_index      INT         NOT NULL,
+    event_payload    JSONB       NOT NULL,
+    error_message    TEXT        NOT NULL,
+    attempts         INT         NOT NULL DEFAULT 1,
+    occurred_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    replayed_at      TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_failed_events_occurred_at ON failed_events (occurred_at DESC);
+CREATE INDEX IF NOT EXISTS idx_failed_events_pending ON failed_events (occurred_at) WHERE replayed_at IS NULL;

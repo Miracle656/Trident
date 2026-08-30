@@ -73,6 +73,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("{e}");
         std::process::exit(1);
     });
+    cfg.log_effective_config();
 
     metrics::install(cfg.metrics_port)?;
 

@@ -284,7 +284,7 @@ export interface paths {
         };
         /**
          * List API keys
-         * @description List all API keys (admin only)
+         * @description List API keys (admin only), keyset-paginated (issue #220). Ordered newest first (created_at DESC, id DESC as tiebreaker); cursor is opaque — never construct or parse it, just pass back the value returned in next_cursor.
          */
         get: operations["listApiKeys"];
         put?: never;
@@ -591,6 +591,20 @@ export interface components {
             /** @description Storage snapshot values (latest, or full history when queried via /storage/history) */
             values: components["schemas"]["ContractStorageValue"][];
         };
+        ContractStorageHistoryResponse: {
+            /** @description The contract whose storage history was queried */
+            contract_id: string;
+            /** @description Network the contract is indexed on */
+            network: string;
+            /** @description The storage key whose history was queried */
+            storage_key: string;
+            /** @description Storage history entries, oldest first */
+            values: components["schemas"]["ContractStorageValue"][];
+            /** @description Whether more pages are available */
+            has_more: boolean;
+            /** @description Opaque cursor to pass as the cursor parameter for the next page */
+            next_cursor?: string | null;
+        };
         ContractStorageValue: {
             /** @description Base64-encoded XDR LedgerKey this value was read from */
             storage_key: string;
@@ -632,6 +646,10 @@ export interface components {
              * @description Timestamp when response was generated
              */
             generated_at: string;
+            /** @description Whether more pages are available */
+            has_more: boolean;
+            /** @description Opaque cursor to pass as the cursor parameter for the next page */
+            next_cursor?: string | null;
         };
         ContractStats: {
             /** @description Soroban contract address */
@@ -684,9 +702,38 @@ export interface components {
             /** Format: date-time */
             created_at: string;
         };
+        ListAPIKeysResponse: {
+            api_keys: components["schemas"]["APIKeyResponse"][];
+            /** @description Whether another page is available. */
+            has_more: boolean;
+            /** @description Opaque cursor for the next page (null if has_more is false). */
+            next_cursor: string | null;
+        };
+        ListContractsResponse: {
+            contracts: components["schemas"]["ContractResponse"][];
+            /** @description Whether another page is available. */
+            has_more: boolean;
+            /** @description Opaque cursor for the next page (null if has_more is false). */
+            next_cursor: string | null;
+        };
+        ContractResponse: {
+            /** Format: uuid */
+            id: string;
+            /** @description Stellar contract id (C... strkey). */
+            contract_id: string;
+            network?: string | null;
+            label?: string | null;
+            /**
+             * Format: int64
+             * @description Ledger sequence indexing began from.
+             */
+            index_from: number;
+            /** Format: date-time */
+            created_at: string;
+        };
         ErrorResponse: {
             error: {
-                /** @description Error code (e.g., INVALID_ARGUMENT, INTERNAL, UNAVAILABLE) */
+                /** @description Error code (e.g., INVALID_ARGUMENT, INTERNAL, UNAVAILABLE, CONFLICT) */
                 code: string;
                 /** @description Human-readable error message */
                 message: string;
@@ -756,8 +803,23 @@ export interface components {
                 "application/json": components["schemas"]["ErrorResponse"];
             };
         };
+        /** @description The supplied Idempotency-Key was already used with a request that does not match this one (error.code CONFLICT). Retry with a new key, or resend the exact original request body to get the original response replayed instead (issue #225). */
+        Conflict: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["ErrorResponse"];
+            };
+        };
     };
-    parameters: never;
+    parameters: {
+        /**
+         * @description Opt-in de-duplication for retried create requests (issue #225). A retry carrying the same key and an identical request body replays the original response (see the `Idempotent-Replayed: true` response header) instead of creating a second resource. The same key reused with a different body is rejected with 409 Conflict. Keys are remembered for 24 hours; max length 255 characters.
+         * @example 7da8f2b1-2e3c-4b8a-9f0d-6a1e5c3d9b7f
+         */
+        IdempotencyKey: string;
+    };
     requestBodies: never;
     headers: {
         /**
@@ -785,6 +847,11 @@ export interface components {
          * @example HIT
          */
         "X-Cache": "HIT" | "MISS";
+        /**
+         * @description Present and set to "true" only when this response was replayed from a prior request carrying the same Idempotency-Key (issue #225). Absent on the original (first) execution.
+         * @example true
+         */
+        "Idempotent-Replayed": "true";
     };
     pathItems: never;
 }
@@ -1040,9 +1107,10 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Contract event schema registry entry */
+            /** @description Contract event schema registry entry. Cached for 5 minutes (issue #221) — see X-Cache. */
             200: {
                 headers: {
+                    "X-Cache": components["headers"]["X-Cache"];
                     "X-RateLimit-Limit": components["headers"]["X-RateLimit-Limit"];
                     "X-RateLimit-Remaining": components["headers"]["X-RateLimit-Remaining"];
                     "X-RateLimit-Reset": components["headers"]["X-RateLimit-Reset"];
@@ -1070,9 +1138,10 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Contract spec and detected interfaces */
+            /** @description Contract spec and detected interfaces. Cached for 5 minutes (issue #221) — see X-Cache. */
             200: {
                 headers: {
+                    "X-Cache": components["headers"]["X-Cache"];
                     "X-RateLimit-Limit": components["headers"]["X-RateLimit-Limit"];
                     "X-RateLimit-Remaining": components["headers"]["X-RateLimit-Remaining"];
                     "X-RateLimit-Reset": components["headers"]["X-RateLimit-Reset"];
@@ -1124,6 +1193,10 @@ export interface operations {
             query: {
                 /** @description Storage key to fetch history for, as returned by the storage/spec endpoints */
                 key: string;
+                /** @description Maximum number of history entries to return */
+                limit?: number;
+                /** @description Opaque pagination cursor from previous response's next_cursor (for next page) */
+                cursor?: string;
             };
             header?: never;
             path: {
@@ -1143,7 +1216,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["ContractStorageResponse"];
+                    "application/json": components["schemas"]["ContractStorageHistoryResponse"];
                 };
             };
             400: components["responses"]["BadRequest"];
@@ -1185,6 +1258,8 @@ export interface operations {
                 network?: "testnet" | "mainnet";
                 /** @description Number of top contracts to return */
                 limit?: number;
+                /** @description Opaque pagination cursor from previous response's next_cursor (for next page) */
+                cursor?: string;
             };
             header?: never;
             path?: never;
@@ -1213,24 +1288,27 @@ export interface operations {
     };
     listApiKeys: {
         parameters: {
-            query?: never;
+            query?: {
+                limit?: number;
+                /** @description Opaque pagination cursor from a previous response's next_cursor. */
+                cursor?: string;
+            };
             header?: never;
             path?: never;
             cookie?: never;
         };
         requestBody?: never;
         responses: {
-            /** @description List of API keys */
+            /** @description Page of API keys */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": {
-                        api_keys: components["schemas"]["APIKeyResponse"][];
-                    };
+                    "application/json": components["schemas"]["ListAPIKeysResponse"];
                 };
             };
+            400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
             429: components["responses"]["TooManyRequestsIPOnly"];
         };
@@ -1238,7 +1316,13 @@ export interface operations {
     createApiKey: {
         parameters: {
             query?: never;
-            header?: never;
+            header?: {
+                /**
+                 * @description Opt-in de-duplication for retried create requests (issue #225). A retry carrying the same key and an identical request body replays the original response (see the `Idempotent-Replayed: true` response header) instead of creating a second resource. The same key reused with a different body is rejected with 409 Conflict. Keys are remembered for 24 hours; max length 255 characters.
+                 * @example 7da8f2b1-2e3c-4b8a-9f0d-6a1e5c3d9b7f
+                 */
+                "Idempotency-Key"?: components["parameters"]["IdempotencyKey"];
+            };
             path?: never;
             cookie?: never;
         };
@@ -1266,6 +1350,7 @@ export interface operations {
             /** @description API key created */
             201: {
                 headers: {
+                    "Idempotent-Replayed": components["headers"]["Idempotent-Replayed"];
                     [name: string]: unknown;
                 };
                 content: {
@@ -1274,6 +1359,7 @@ export interface operations {
             };
             400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
+            409: components["responses"]["Conflict"];
             429: components["responses"]["TooManyRequestsIPOnly"];
         };
     };

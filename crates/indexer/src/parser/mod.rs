@@ -31,6 +31,7 @@ use sac::SacRegistry;
 use token_events::TokenEvent;
 
 /// A normalised event together with its optional typed projections.
+#[derive(Debug)]
 pub struct ParsedEvent {
     pub event: SorobanEvent,
     /// `Some` only for standard SEP-41 / SAC value-movement events whose payload
@@ -315,11 +316,38 @@ pub fn scval_to_string(val: &ScVal) -> String {
         // deliberately: the variant carries a code whose meaning is
         // contract-defined, so there is no stable scalar to project it to.
         ScVal::Error(e) => format!("{e:?}"),
-        // For complex types in topic position, fall back to debug representation
-        other => {
-            crate::metrics::record_unhandled_scvariant();
-            format!("{other:?}")
-        }
+        ScVal::Vec(Some(items)) => format!(
+            "[{}]",
+            items
+                .iter()
+                .map(scval_to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        ScVal::Vec(None) => "Vec(None)".to_string(),
+        ScVal::Map(Some(entries)) => format!(
+            "{{{}}}",
+            entries
+                .iter()
+                .map(|e| format!("{}:{}", scval_to_string(&e.key), scval_to_string(&e.val)))
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        ScVal::Map(None) => "Map(None)".to_string(),
+        // Complex host-object types (issue #209). These carry structured data
+        // rather than a single scalar, so the compact string form names the
+        // variant with just enough of its payload to be useful in a topic
+        // string; the full structure is only available via scval_to_json.
+        ScVal::ContractInstance(inst) => match &inst.executable {
+            stellar_xdr::curr::ContractExecutable::Wasm(hash) => {
+                format!("contract_instance(wasm:{})", hex::encode(hash.0))
+            }
+            stellar_xdr::curr::ContractExecutable::StellarAsset => {
+                "contract_instance(stellar_asset)".to_string()
+            }
+        },
+        ScVal::LedgerKeyContractInstance => "ledger_key_contract_instance".to_string(),
+        ScVal::LedgerKeyNonce(nonce) => nonce.nonce.to_string(),
     }
 }
 
@@ -373,19 +401,58 @@ pub fn scval_to_json(val: &ScVal) -> Json {
         ScVal::Error(e) => Json::String(format!("{e:?}")),
         ScVal::Vec(Some(items)) => Json::Array(items.iter().map(scval_to_json).collect()),
         ScVal::Vec(None) => Json::Array(vec![]),
-        ScVal::Map(Some(entries)) => {
-            let obj: serde_json::Map<String, Json> = entries
-                .iter()
-                .map(|e| (scval_to_string(&e.key), scval_to_json(&e.val)))
-                .collect();
+        ScVal::Map(Some(entries)) => scmap_to_json(entries),
+        ScVal::Map(None) => Json::Object(serde_json::Map::new()),
+        // Complex host-object types (issue #209). `ContractInstance` is the
+        // full data behind a contract's ledger entry — which Wasm it runs (or
+        // that it's a built-in Stellar Asset Contract) plus its persistent
+        // instance storage — so it is projected as a structured object rather
+        // than collapsed to a debug string. The two ledger-key marker variants
+        // (`LedgerKeyContractInstance`/`LedgerKeyNonce`) never carry a
+        // contract-defined payload — they exist to select a ledger entry by
+        // key, not to hold data — so their JSON shape is a fixed, documented
+        // one rather than something contract-specific.
+        ScVal::ContractInstance(inst) => {
+            let executable = match &inst.executable {
+                stellar_xdr::curr::ContractExecutable::Wasm(hash) => {
+                    let mut m = serde_json::Map::new();
+                    m.insert("type".into(), Json::String("wasm".into()));
+                    m.insert("wasm_hash".into(), Json::String(hex::encode(hash.0)));
+                    Json::Object(m)
+                }
+                stellar_xdr::curr::ContractExecutable::StellarAsset => {
+                    let mut m = serde_json::Map::new();
+                    m.insert("type".into(), Json::String("stellar_asset".into()));
+                    Json::Object(m)
+                }
+            };
+            let storage = match &inst.storage {
+                Some(entries) => scmap_to_json(entries),
+                None => Json::Null,
+            };
+            let mut obj = serde_json::Map::new();
+            obj.insert("executable".into(), executable);
+            obj.insert("storage".into(), storage);
             Json::Object(obj)
         }
-        ScVal::Map(None) => Json::Object(serde_json::Map::new()),
-        other => {
-            crate::metrics::record_unhandled_scvariant();
-            Json::String(format!("{other:?}"))
+        ScVal::LedgerKeyContractInstance => Json::String("ledger_key_contract_instance".into()),
+        ScVal::LedgerKeyNonce(nonce) => {
+            let mut obj = serde_json::Map::new();
+            obj.insert("nonce".into(), Json::String(nonce.nonce.to_string()));
+            Json::Object(obj)
         }
     }
+}
+
+/// Convert a decoded `ScMap` to a JSON object. Shared by `ScVal::Map` and
+/// `ScVal::ContractInstance`'s `storage` field, which is the same underlying
+/// type (issue #209).
+fn scmap_to_json(entries: &stellar_xdr::curr::ScMap) -> Json {
+    let obj: serde_json::Map<String, Json> = entries
+        .iter()
+        .map(|e| (scval_to_string(&e.key), scval_to_json(&e.val)))
+        .collect();
+    Json::Object(obj)
 }
 
 pub(crate) fn scaddress_to_string(addr: &ScAddress) -> String {
@@ -407,8 +474,9 @@ mod tests {
     use super::*;
     use base64::{engine::general_purpose::STANDARD, Engine};
     use stellar_xdr::curr::{
-        AccountId, BytesM, ContractId, Hash, Int128Parts, Limited, Limits, PublicKey, ScAddress,
-        ScMap, ScMapEntry, ScString, ScSymbol, ScVal, Uint256, VecM, WriteXdr,
+        AccountId, BytesM, ContractExecutable, ContractId, Hash, Int128Parts, Limited, Limits,
+        PublicKey, ScAddress, ScContractInstance, ScMap, ScMapEntry, ScNonceKey, ScString,
+        ScSymbol, ScVal, Uint256, VecM, WriteXdr,
     };
 
     use crate::rpc::RawEvent;
@@ -1225,6 +1293,266 @@ mod tests {
         assert_eq!(scval_to_json(&ScVal::Void), Json::Null);
     }
 
+    // -----------------------------------------------------------------------
+    // Full ScVal variant coverage (issue #209)
+    // -----------------------------------------------------------------------
+    //
+    // `ScVal` (stellar-xdr `curr::ScVal`) has exactly 22 variants. `scval_to_string`
+    // and `scval_to_json` match every one explicitly with no wildcard arm, so
+    // adding a 23rd variant on a future stellar-xdr upgrade is a compile error
+    // here rather than a silent debug-format fallback. This table exercises
+    // each variant once end-to-end and pins its documented JSON shape (see
+    // docs/indexer/scval-json-mapping.md) as a golden test.
+
+    fn sample_contract_instance_wasm() -> ScVal {
+        ScVal::ContractInstance(ScContractInstance {
+            executable: ContractExecutable::Wasm(Hash([0xAB; 32])),
+            storage: None,
+        })
+    }
+
+    fn sample_contract_instance_stellar_asset_with_storage() -> ScVal {
+        let entries = VecM::try_from(vec![ScMapEntry {
+            key: ScVal::Symbol(ScSymbol::try_from("decimals".to_string()).unwrap()),
+            val: ScVal::U32(7),
+        }])
+        .unwrap();
+        ScVal::ContractInstance(ScContractInstance {
+            executable: ContractExecutable::StellarAsset,
+            storage: Some(ScMap(entries)),
+        })
+    }
+
+    #[test]
+    fn every_scval_variant_has_a_documented_json_shape() {
+        let map_entries = VecM::try_from(vec![ScMapEntry {
+            key: ScVal::Symbol(ScSymbol::try_from("k".to_string()).unwrap()),
+            val: ScVal::U32(1),
+        }])
+        .unwrap();
+
+        let cases: Vec<(&str, ScVal, Json)> = vec![
+            ("Bool", ScVal::Bool(true), Json::Bool(true)),
+            ("Void", ScVal::Void, Json::Null),
+            (
+                "Error",
+                ScVal::Error(stellar_xdr::curr::ScError::Contract(9)),
+                Json::String(format!("{:?}", stellar_xdr::curr::ScError::Contract(9))),
+            ),
+            ("U32", ScVal::U32(42), Json::from(42u32)),
+            ("I32", ScVal::I32(-42), Json::from(-42i32)),
+            ("U64", ScVal::U64(42), Json::from(42u64)),
+            ("I64", ScVal::I64(-42), Json::from(-42i64)),
+            (
+                "Timepoint",
+                ScVal::Timepoint(stellar_xdr::curr::TimePoint(1_700_000_000)),
+                Json::String("1700000000".to_string()),
+            ),
+            (
+                "Duration",
+                ScVal::Duration(stellar_xdr::curr::Duration(60)),
+                Json::String("60".to_string()),
+            ),
+            (
+                "U128",
+                ScVal::U128(stellar_xdr::curr::UInt128Parts { hi: 0, lo: 100 }),
+                Json::from(100u64),
+            ),
+            (
+                "I128",
+                ScVal::I128(Int128Parts {
+                    hi: -1,
+                    lo: u64::MAX,
+                }),
+                Json::from(-1i64),
+            ),
+            (
+                "U256",
+                ScVal::U256(stellar_xdr::curr::UInt256Parts {
+                    hi_hi: 0,
+                    hi_lo: 0,
+                    lo_hi: 0,
+                    lo_lo: 5,
+                }),
+                Json::String("5".to_string()),
+            ),
+            (
+                "I256",
+                ScVal::I256(stellar_xdr::curr::Int256Parts {
+                    hi_hi: 0,
+                    hi_lo: 0,
+                    lo_hi: 0,
+                    lo_lo: 5,
+                }),
+                Json::String("5".to_string()),
+            ),
+            (
+                "Bytes",
+                ScVal::Bytes(stellar_xdr::curr::ScBytes(
+                    BytesM::try_from(vec![0xDE, 0xAD]).unwrap(),
+                )),
+                Json::String("dead".to_string()),
+            ),
+            (
+                "String",
+                ScVal::String(ScString(
+                    stellar_xdr::curr::StringM::try_from(b"hi".to_vec()).unwrap(),
+                )),
+                Json::String("hi".to_string()),
+            ),
+            (
+                "Symbol",
+                ScVal::Symbol(ScSymbol::try_from("sym".to_string()).unwrap()),
+                Json::String("sym".to_string()),
+            ),
+            (
+                "Vec(Some)",
+                ScVal::Vec(Some(stellar_xdr::curr::ScVec(
+                    VecM::try_from(vec![ScVal::U32(1)]).unwrap(),
+                ))),
+                Json::Array(vec![Json::from(1u32)]),
+            ),
+            ("Vec(None)", ScVal::Vec(None), Json::Array(vec![])),
+            (
+                "Map(Some)",
+                ScVal::Map(Some(ScMap(map_entries))),
+                Json::Object({
+                    let mut m = serde_json::Map::new();
+                    m.insert("k".to_string(), Json::from(1u32));
+                    m
+                }),
+            ),
+            (
+                "Map(None)",
+                ScVal::Map(None),
+                Json::Object(serde_json::Map::new()),
+            ),
+            (
+                "Address",
+                ScVal::Address(ScAddress::Contract(ContractId(Hash([0u8; 32])))),
+                Json::String(scaddress_to_string(&ScAddress::Contract(ContractId(Hash(
+                    [0u8; 32],
+                ))))),
+            ),
+            (
+                "ContractInstance(Wasm)",
+                sample_contract_instance_wasm(),
+                Json::Object({
+                    let mut executable = serde_json::Map::new();
+                    executable.insert("type".to_string(), Json::String("wasm".to_string()));
+                    executable.insert(
+                        "wasm_hash".to_string(),
+                        Json::String(hex::encode([0xAB; 32])),
+                    );
+                    let mut m = serde_json::Map::new();
+                    m.insert("executable".to_string(), Json::Object(executable));
+                    m.insert("storage".to_string(), Json::Null);
+                    m
+                }),
+            ),
+            (
+                "ContractInstance(StellarAsset+storage)",
+                sample_contract_instance_stellar_asset_with_storage(),
+                Json::Object({
+                    let mut executable = serde_json::Map::new();
+                    executable.insert(
+                        "type".to_string(),
+                        Json::String("stellar_asset".to_string()),
+                    );
+                    let mut storage = serde_json::Map::new();
+                    storage.insert("decimals".to_string(), Json::from(7u32));
+                    let mut m = serde_json::Map::new();
+                    m.insert("executable".to_string(), Json::Object(executable));
+                    m.insert("storage".to_string(), Json::Object(storage));
+                    m
+                }),
+            ),
+            (
+                "LedgerKeyContractInstance",
+                ScVal::LedgerKeyContractInstance,
+                Json::String("ledger_key_contract_instance".to_string()),
+            ),
+            (
+                "LedgerKeyNonce",
+                ScVal::LedgerKeyNonce(ScNonceKey { nonce: 99 }),
+                Json::Object({
+                    let mut m = serde_json::Map::new();
+                    m.insert("nonce".to_string(), Json::String("99".to_string()));
+                    m
+                }),
+            ),
+        ];
+
+        for (name, val, expected_json) in cases {
+            // Never panics, decodes to the documented shape, and round-trips
+            // through serde_json (guards against e.g. a NaN or non-finite
+            // float slipping through, which this codec never produces but a
+            // future edit could).
+            let json = scval_to_json(&val);
+            assert_eq!(json, expected_json, "unexpected JSON shape for {name}");
+            let s = serde_json::to_string(&json)
+                .unwrap_or_else(|e| panic!("{name} JSON must serialise: {e}"));
+            let _: Json = serde_json::from_str(&s)
+                .unwrap_or_else(|e| panic!("{name} JSON must round-trip: {e}"));
+
+            // scval_to_string must not panic on any variant either.
+            let _ = scval_to_string(&val);
+        }
+    }
+
+    #[test]
+    fn contract_instance_string_repr_names_the_executable_kind() {
+        assert!(scval_to_string(&sample_contract_instance_wasm()).contains("wasm"));
+        assert!(
+            scval_to_string(&sample_contract_instance_stellar_asset_with_storage())
+                .contains("stellar_asset")
+        );
+    }
+
+    #[test]
+    fn ledger_key_variants_have_stable_string_repr() {
+        assert_eq!(
+            scval_to_string(&ScVal::LedgerKeyContractInstance),
+            "ledger_key_contract_instance"
+        );
+        assert_eq!(
+            scval_to_string(&ScVal::LedgerKeyNonce(ScNonceKey { nonce: 99 })),
+            "99"
+        );
+    }
+
+    #[test]
+    fn nested_map_inside_vec_inside_contract_instance_storage_decodes_recursively() {
+        // Recursive/nested structures (issue #209 acceptance criterion): a Map
+        // holding a Vec holding a Map, nested inside a ContractInstance's
+        // storage, all decode without truncation or panic.
+        let inner_map = ScMap(
+            VecM::try_from(vec![ScMapEntry {
+                key: ScVal::Symbol(ScSymbol::try_from("inner".to_string()).unwrap()),
+                val: ScVal::I32(-1),
+            }])
+            .unwrap(),
+        );
+        let vec_of_maps = ScVal::Vec(Some(stellar_xdr::curr::ScVec(
+            VecM::try_from(vec![ScVal::Map(Some(inner_map))]).unwrap(),
+        )));
+        let outer_storage = ScMap(
+            VecM::try_from(vec![ScMapEntry {
+                key: ScVal::Symbol(ScSymbol::try_from("items".to_string()).unwrap()),
+                val: vec_of_maps,
+            }])
+            .unwrap(),
+        );
+        let val = ScVal::ContractInstance(ScContractInstance {
+            executable: ContractExecutable::StellarAsset,
+            storage: Some(outer_storage),
+        });
+
+        let json = scval_to_json(&val);
+        let inner = &json["storage"]["items"][0]["inner"];
+        assert_eq!(*inner, Json::from(-1i32));
+    }
+
     #[test]
     fn decode_scval_round_trip() {
         // Encode a ScVal to XDR, base64, decode, and verify it matches.
@@ -1424,6 +1752,160 @@ mod tests {
                     assert!(!s.is_empty(), "scval_to_string must not return empty for non-Void");
                 }
             }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Whole-entry-point fuzzing (issue #219)
+    // -----------------------------------------------------------------------
+    //
+    // The #416 suite above fuzzes `decode_scval`/`scval_to_string`/
+    // `scval_to_json` directly. Those are internal helpers; the actual attack
+    // surface facing untrusted on-chain bytes is `Parser::parse_event_with_
+    // projection`, which additionally parses `event_type`/`ledger` strings,
+    // decodes every topic, and runs the SEP-41/NFT/invocation projections on
+    // top of the decoded value. This suite drives that entry point directly.
+
+    /// Generate an arbitrary, frequently-malformed `RawEvent` — the actual
+    /// parser entry point. Each field mixes a plausible value with garbage so
+    /// the fuzzer exercises the full decode -> normalise -> project pipeline
+    /// (event-type parsing, per-topic XDR decode, token/NFT projection),
+    /// not just a single inner conversion.
+    fn arb_raw_event() -> impl Strategy<Value = RawEvent> {
+        let arb_sc_encoded = prop_oneof![arb_scval_b64(), arb_raw_b64()];
+        (
+            prop_oneof![
+                3 => Just("contract".to_string()),
+                3 => Just("system".to_string()),
+                3 => Just("diagnostic".to_string()),
+                1 => "[a-zA-Z]{0,12}",
+            ],
+            prop_oneof![
+                3 => "[0-9]{1,10}",
+                1 => "[a-zA-Z!]{0,10}",
+                1 => Just(String::new()),
+            ],
+            proptest::option::of("[A-Za-z0-9]{0,56}"),
+            proptest::collection::vec(arb_sc_encoded.clone(), 0..6),
+            prop_oneof![
+                3 => arb_scval_b64(),
+                2 => arb_raw_b64(),
+                1 => Just(String::new()),
+            ],
+            any::<bool>(),
+        )
+            .prop_map(
+                |(event_type, ledger, contract_id, topic, value, successful)| RawEvent {
+                    event_type,
+                    ledger,
+                    ledger_closed_at: "2024-06-01T00:00:00Z".to_string(),
+                    contract_id,
+                    id: "fuzz-id".to_string(),
+                    paging_token: None,
+                    tx_hash: "fuzzhash".to_string(),
+                    operation_index: None,
+                    topic,
+                    value,
+                    in_successful_contract_call: successful,
+                },
+            )
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(2000))]
+
+        /// The core invariant this issue asks for: for any input, the parser
+        /// entry point returns `Ok(Some(_))`, `Ok(None)`, or an `Err` the
+        /// caller can record — it never panics. A panic here would abort the
+        /// streamer's poll loop on a single crafted event (issue #219).
+        #[test]
+        fn parse_event_with_projection_never_panics(raw in arb_raw_event()) {
+            let parser = Parser::new(true);
+            let _ = parser.parse_event_with_projection(&raw);
+        }
+
+        /// Same invariant with diagnostic events excluded, matching the
+        /// production default (`INDEX_DIAGNOSTIC=false`) and its early-return
+        /// branch in `parse_event_with_projection`.
+        #[test]
+        fn parse_event_with_projection_never_panics_index_diagnostic_false(raw in arb_raw_event()) {
+            let parser = Parser::new(false);
+            let _ = parser.parse_event_with_projection(&raw);
+        }
+    }
+
+    /// Seed corpus of realistic (non-random) event shapes, run as ordinary
+    /// regression tests rather than through proptest's random search (issue
+    /// #219: "seed the corpus with real testnet events"). These mirror
+    /// payload shapes actually seen from Soroban RPC — a SEP-41 transfer, a
+    /// diagnostic event, a system fee event, and an event with a Map-typed
+    /// body — so the fuzz suite's random search is complemented by fixed
+    /// cases known to matter, and a future edit that breaks one of these
+    /// shapes fails immediately instead of waiting on proptest to rediscover
+    /// it.
+    #[test]
+    fn seed_corpus_of_realistic_events_parses_without_panicking() {
+        let addr = |seed: u8| {
+            ScVal::Address(ScAddress::Account(AccountId(
+                PublicKey::PublicKeyTypeEd25519(stellar_xdr::curr::Uint256([seed; 32])),
+            )))
+        };
+
+        let seeds: Vec<RawEvent> = vec![
+            // A standard SEP-41 `transfer` event.
+            make_event(
+                "contract",
+                Some("CCONTRACT"),
+                vec![sym("transfer"), addr(1), addr(2)],
+                ScVal::I128(Int128Parts {
+                    hi: 0,
+                    lo: 1_000_000,
+                }),
+                true,
+            ),
+            // A diagnostic event (skipped unless index_diagnostic is set).
+            make_event(
+                "diagnostic",
+                Some("CCONTRACT"),
+                vec![sym("log")],
+                ScVal::String(ScString(
+                    stellar_xdr::curr::StringM::try_from(b"debug".to_vec()).unwrap(),
+                )),
+                true,
+            ),
+            // A system event with a Map-typed body (fee/resource accounting
+            // shapes commonly look like this).
+            make_event(
+                "system",
+                None,
+                vec![sym("fee_charged")],
+                ScVal::Map(Some(ScMap(
+                    VecM::try_from(vec![ScMapEntry {
+                        key: ScVal::Symbol(ScSymbol::try_from("amount".to_string()).unwrap()),
+                        val: ScVal::I64(12_345),
+                    }])
+                    .unwrap(),
+                ))),
+                true,
+            ),
+            // An event from a failed contract call — must be skipped
+            // (`Ok(None)`), not treated as an error.
+            make_event(
+                "contract",
+                Some("CCONTRACT"),
+                vec![sym("transfer")],
+                ScVal::Void,
+                false,
+            ),
+        ];
+
+        let parser = Parser::new(true);
+        for raw in &seeds {
+            let result = parser.parse_event_with_projection(raw);
+            assert!(
+                result.is_ok(),
+                "seed corpus event must parse cleanly: {raw:?} -> {result:?}"
+            );
         }
     }
 }
